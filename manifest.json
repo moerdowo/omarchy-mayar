@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.moerdowo.mayar",
+  "name": "Mayar",
+  "version": "1.0.0",
+  "author": "moerdowo",
+  "description": "Mayar merchant balance and recent transactions",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Mayar",
+    "description": "Shows your Mayar available balance, with paid and unpaid transactions",
+    "category": "Utilities",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

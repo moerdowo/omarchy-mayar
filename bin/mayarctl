@@ -1,0 +1,407 @@
+#!/usr/bin/env bash
+# mayarctl — read a Mayar merchant account from the command line: balance,
+# paid transactions, unpaid transactions.
+#
+# All network and credential handling lives here rather than in Panel.qml, so
+# the same behavior is available from a terminal and there is one place where
+# the API contract and the key storage are implemented.
+#
+#   mayarctl status              print JSON for the bar widget (never fails)
+#   mayarctl balance             print JSON balance
+#   mayarctl paid   [-n N]       print JSON paid transactions
+#   mayarctl unpaid [-n N]       print JSON unpaid transactions
+#   mayarctl login               store an API key in the keyring, interactively
+#   mayarctl logout              remove the stored key
+#   mayarctl auth                print JSON describing where the key comes from
+#   mayarctl refresh             drop the response cache
+#
+# On "login": Mayar has no merchant login endpoint. API v2 authenticates with
+# `Authorization: Bearer <api-key>` and nothing else — the only login in the
+# docs is a magic link that logs your *customers* into their portal. So `login`
+# is not an OAuth exchange; it prompts for the key once, verifies it against
+# /balances, and puts it in the login keyring so it never sits in a dotfile.
+# The api-key path (MAYAR_API_KEY, or the config file) stays available for
+# headless use where no keyring is unlocked.
+
+# No `set -e`. The panel polls `status` and renders whatever JSON comes back;
+# a failed API call is a state to report, not a reason to exit and hand the
+# panel an empty stdout.
+set -uo pipefail
+
+SERVICE=mayar
+ACCOUNT=api-key
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/mayar"
+CONFIG_FILE="$CONFIG_DIR/apikey"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-mayar"
+
+# How long a cached response stays good. The bar widget polls far more often
+# than the numbers change, and every poll is a request against a rate limit the
+# docs do not publish — so the widget's cadence is decoupled from the API's.
+CACHE_TTL="${MAYAR_CACHE_TTL:-60}"
+
+# Sandbox keys only work against api.mayar.io, production keys only against
+# api.mayar.id. Selected by environment so a single install can be pointed at
+# either without editing anything.
+case "${MAYAR_ENV:-production}" in
+sandbox) API_BASE="https://api.mayar.io/hl/v2" ;;
+*) API_BASE="https://api.mayar.id/hl/v2" ;;
+esac
+
+die() {
+  echo "mayarctl: $*" >&2
+  exit 1
+}
+
+need() { command -v "$1" >/dev/null 2>&1 || die "missing required command '$1'"; }
+need curl
+need jq
+
+# ---------------------------------------------------------------- credentials
+
+# Precedence is deliberate: an explicit environment variable beats the keyring,
+# so a one-off `MAYAR_API_KEY=... mayarctl paid` works without disturbing what
+# is stored. The config file is last — it is the fallback for headless machines
+# where no keyring daemon is running.
+key_source=""
+
+api_key() {
+  local k
+
+  if [[ -n ${MAYAR_API_KEY:-} ]]; then
+    key_source=env
+    printf '%s' "$MAYAR_API_KEY"
+    return 0
+  fi
+
+  if command -v secret-tool >/dev/null 2>&1; then
+    k=$(secret-tool lookup service "$SERVICE" account "$ACCOUNT" 2>/dev/null)
+    if [[ -n $k ]]; then
+      key_source=keyring
+      printf '%s' "$k"
+      return 0
+    fi
+  fi
+
+  if [[ -r $CONFIG_FILE ]]; then
+    k=$(tr -d '[:space:]' <"$CONFIG_FILE")
+    if [[ -n $k ]]; then
+      key_source=file
+      printf '%s' "$k"
+      return 0
+    fi
+  fi
+
+  key_source=none
+  return 1
+}
+
+do_login() {
+  local key resp code
+
+  command -v secret-tool >/dev/null 2>&1 ||
+    die "secret-tool not installed — set MAYAR_API_KEY or write the key to $CONFIG_FILE instead"
+
+  cat <<'EOF'
+Mayar has no login endpoint — API v2 authenticates with an API key only.
+Create one at:
+
+  production  https://web.mayar.id/integration/apikey
+  sandbox     https://web.mayar.io/integration/apikey
+
+A Read Only key is enough for this plugin; it never issues a POST.
+
+EOF
+
+  # -s so the key does not land in the scrollback or, worse, the shell history
+  # of whoever is watching.
+  read -rsp "Paste your Mayar API key: " key
+  echo
+  key=$(printf '%s' "$key" | tr -d '[:space:]')
+  [[ -n $key ]] || die "no key entered"
+
+  echo "Verifying against ${API_BASE}/balances ..."
+  # Set it in this shell rather than as a `VAR=x func` prefix: bash scopes such
+  # a prefix to the function only outside POSIX mode, which is a difference the
+  # verification step should not depend on.
+  local saved=${MAYAR_API_KEY:-}
+  MAYAR_API_KEY="$key"
+  resp=$(api_get "/balances")
+  code=$?
+  MAYAR_API_KEY=$saved
+  [[ -z $saved ]] && unset MAYAR_API_KEY
+  if ((code != 0)); then
+    echo "$resp" | jq -r '.error // "request failed"' >&2
+    die "key rejected — nothing was stored"
+  fi
+
+  printf '%s' "$key" |
+    secret-tool store --label="Mayar API key" service "$SERVICE" account "$ACCOUNT" ||
+    die "could not write to the keyring"
+
+  rm -rf "$CACHE_DIR"
+  echo "Stored in the login keyring. Balance reads:"
+  echo "$resp" | jq -r '.data | "  active  \(.balanceActive)\n  pending \(.balancePending)\n  total   \(.balance)"'
+}
+
+do_logout() {
+  local cleared=0
+  if command -v secret-tool >/dev/null 2>&1; then
+    secret-tool clear service "$SERVICE" account "$ACCOUNT" 2>/dev/null && cleared=1
+  fi
+  rm -rf "$CACHE_DIR"
+  if ((cleared)); then
+    echo "Removed the stored key and dropped the cache."
+  else
+    echo "No key was stored in the keyring; dropped the cache."
+  fi
+  [[ -r $CONFIG_FILE ]] &&
+    echo "Note: $CONFIG_FILE still exists and will still be used. Delete it too if you meant to."
+  [[ -n ${MAYAR_API_KEY:-} ]] &&
+    echo "Note: MAYAR_API_KEY is set in this environment and takes precedence."
+  return 0
+}
+
+# ------------------------------------------------------------------- requests
+
+# Echoes a JSON body on success. On failure echoes {"error": "..."} and returns
+# non-zero, so callers can distinguish the two without parsing prose.
+api_get() {
+  local path=$1 key body http sep
+  key=$(api_key) || {
+    echo '{"error":"no API key"}'
+    return 1
+  }
+
+  # -w appends the status after the body; split on a separator that cannot
+  # appear in JSON so a body containing newlines still parses.
+  sep=$'\x1e'
+  body=$(curl -sS \
+    --connect-timeout 5 --max-time 15 \
+    -H "Authorization: Bearer ${key}" \
+    -H "Accept: application/json" \
+    -w "${sep}%{http_code}" \
+    "${API_BASE}${path}" 2>&1)
+
+  if [[ $body != *"$sep"* ]]; then
+    # curl failed before it got a response — the message is the whole output.
+    jq -nc --arg m "${body:-network error}" '{error:$m}'
+    return 1
+  fi
+
+  http=${body##*"$sep"}
+  body=${body%"$sep"*}
+
+  if [[ $http != 2* ]]; then
+    local msg
+    msg=$(echo "$body" | jq -r '.messages // .message // empty' 2>/dev/null)
+    [[ -n $msg ]] || msg="HTTP $http"
+    # 401 is the one worth naming, because it means "re-run login", not
+    # "try again later".
+    [[ $http == 401 || $http == 403 ]] && msg="unauthorized — check the API key ($msg)"
+    jq -nc --arg m "$msg" --argjson s "$http" '{error:$m,status:$s}'
+    return 1
+  fi
+
+  if ! echo "$body" | jq -e . >/dev/null 2>&1; then
+    jq -nc '{error:"response was not JSON"}'
+    return 1
+  fi
+
+  printf '%s' "$body"
+}
+
+# api_get through a TTL cache, keyed by path. A stale entry is preferred over
+# an error: if the request fails and something cached exists, the panel keeps
+# showing the last known numbers instead of blanking out.
+cached_get() {
+  local path=$1 slug file age body
+  slug=$(printf '%s' "${MAYAR_ENV:-production}$path" | tr -c 'a-zA-Z0-9' '_')
+  file="$CACHE_DIR/$slug.json"
+
+  if [[ ${FORCE:-0} != 1 && -f $file ]]; then
+    age=$(($(date +%s) - $(stat -c %Y "$file" 2>/dev/null || echo 0)))
+    if ((age < CACHE_TTL)); then
+      cat "$file"
+      return 0
+    fi
+  fi
+
+  body=$(api_get "$path")
+  if (($? == 0)); then
+    mkdir -p "$CACHE_DIR" && chmod 700 "$CACHE_DIR" 2>/dev/null
+    printf '%s' "$body" >"$file.tmp" && mv "$file.tmp" "$file"
+    printf '%s' "$body"
+    return 0
+  fi
+
+  if [[ -f $file ]]; then
+    # Mark it stale so the panel can say so rather than showing old numbers as
+    # if they were current.
+    jq -c --arg e "$(echo "$body" | jq -r '.error // "request failed"')" \
+      '. + {stale:true, staleReason:$e}' "$file" 2>/dev/null && return 0
+  fi
+
+  printf '%s' "$body"
+  return 1
+}
+
+# --------------------------------------------------------------------- shapes
+
+# Normalise the two transaction endpoints into one row shape. They disagree on
+# almost everything: paid rows carry `credit` and a `status` of settled/pending,
+# unpaid rows carry `amount` and a `status` of active/expired, and only unpaid
+# rows have a payment URL. The panel should not have to know that.
+normalise_paid() {
+  jq -c '[.data[]? | {
+    id,
+    kind: "paid",
+    amount: (.credit // 0),
+    status: (.status // "unknown"),
+    createdAt: (.createdAt // null),
+    method: (.paymentMethod // null),
+    type: (.balanceHistoryType // .type // null),
+    customer: (.customer.name // .customer.email // null),
+    label: (.paymentLink.name // null),
+    url: null,
+    fee: ([.fee[]?.debit // 0] | add // 0)
+  }]'
+}
+
+normalise_unpaid() {
+  jq -c '[.data[]? | {
+    id,
+    kind: "unpaid",
+    amount: (.amount // 0),
+    status: (.status // "unknown"),
+    createdAt: (.createdAt // null),
+    method: null,
+    type: (.type // null),
+    customer: (.customer.name // .customer.email // null),
+    label: (.paymentLink.name // .paymentLink.description // null),
+    url: (.paymentUrl // null),
+    fee: 0
+  }]'
+}
+
+# ------------------------------------------------------------------- commands
+
+# Clamp to the API's documented ceiling rather than letting it 400 on us.
+limit_arg() {
+  local n=${1:-10}
+  [[ $n =~ ^[0-9]+$ ]] || n=10
+  ((n < 1)) && n=1
+  ((n > 50)) && n=50
+  echo "$n"
+}
+
+cmd_balance() { cached_get "/balances"; }
+
+cmd_paid() {
+  local n
+  n=$(limit_arg "${1:-10}")
+  cached_get "/transactions?limit=${n}"
+}
+
+cmd_unpaid() {
+  local n
+  n=$(limit_arg "${1:-10}")
+  cached_get "/transactions/unpaid?limit=${n}"
+}
+
+cmd_auth() {
+  local ok=false
+  api_key >/dev/null && ok=true
+  jq -nc \
+    --argjson authenticated "$ok" \
+    --arg source "$key_source" \
+    --arg env "${MAYAR_ENV:-production}" \
+    --arg base "$API_BASE" \
+    --argjson keyring "$(command -v secret-tool >/dev/null 2>&1 && echo true || echo false)" \
+    '{authenticated:$authenticated, source:$source, env:$env, apiBase:$base, keyringAvailable:$keyring}'
+}
+
+# The panel's single entry point. Always prints one valid JSON object on
+# stdout and always exits 0 — an unauthenticated or offline account is a state
+# to render, not an error to propagate.
+cmd_status() {
+  local n bal paid unpaid
+  n=$(limit_arg "${1:-10}")
+
+  if ! api_key >/dev/null; then
+    jq -nc \
+      --arg env "${MAYAR_ENV:-production}" \
+      --argjson keyring "$(command -v secret-tool >/dev/null 2>&1 && echo true || echo false)" \
+      '{hasKey:false, authenticated:false, source:"none", env:$env, keyringAvailable:$keyring,
+        balance:null, paid:[], unpaid:[], error:null, stale:false}'
+    return 0
+  fi
+
+  bal=$(cmd_balance)
+  paid=$(cmd_paid "$n")
+  unpaid=$(cmd_unpaid "$n")
+
+  # First real error wins for the headline; the panel shows one line, not three.
+  local err
+  err=$(jq -rs 'map(.error? // empty) | first // ""' \
+    <<<"$bal"$'\n'"$paid"$'\n'"$unpaid" 2>/dev/null)
+
+  # A key that exists is not the same as a key that works. `hasKey` drives
+  # "is there anything to fix in the keyring", `authenticated` drives what the
+  # panel says — a revoked key must read as NEEDS LOGIN, not as a network blip.
+  local authed=true
+  case $err in
+  *unauthorized*) authed=false ;;
+  esac
+
+  jq -nc \
+    --argjson authed "$authed" \
+    --arg source "$key_source" \
+    --arg env "${MAYAR_ENV:-production}" \
+    --arg err "$err" \
+    --argjson bal "$(jq -c '.data // null' <<<"$bal" 2>/dev/null || echo null)" \
+    --argjson paid "$(normalise_paid <<<"$paid" 2>/dev/null || echo '[]')" \
+    --argjson unpaid "$(normalise_unpaid <<<"$unpaid" 2>/dev/null || echo '[]')" \
+    --argjson stale "$(jq -rs 'map(.stale? // false) | any' <<<"$bal"$'\n'"$paid"$'\n'"$unpaid" 2>/dev/null || echo false)" \
+    '{hasKey:true, authenticated:$authed, source:$source, env:$env, keyringAvailable:true,
+      balance:$bal, paid:$paid, unpaid:$unpaid,
+      error:(if $err == "" then null else $err end), stale:$stale}'
+  return 0
+}
+
+# ---------------------------------------------------------------------- main
+
+FORCE=0
+cmd=${1:-status}
+shift 2>/dev/null
+
+limit=10
+while (($#)); do
+  case $1 in
+  -n | --limit)
+    limit=${2:-10}
+    shift 2
+    ;;
+  -f | --force)
+    FORCE=1
+    shift
+    ;;
+  *)
+    shift
+    ;;
+  esac
+done
+
+case "$cmd" in
+status) cmd_status "$limit" ;;
+balance) cmd_balance ;;
+paid) cmd_paid "$limit" ;;
+unpaid) cmd_unpaid "$limit" ;;
+auth) cmd_auth ;;
+login) do_login ;;
+logout) do_logout ;;
+refresh)
+  rm -rf "$CACHE_DIR"
+  echo "cache dropped"
+  ;;
+*) die "unknown command '$cmd' — try status, balance, paid, unpaid, auth, login, logout, refresh" ;;
+esac
