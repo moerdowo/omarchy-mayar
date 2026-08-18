@@ -356,7 +356,14 @@ Panel {
 
           MayarIcon {
             id: heroIcon
-            iconSize: Style.font.display
+            // Sized to stand as tall as the MAYAR + status block beside it,
+            // rather than to the display font it used to borrow. At that size
+            // the mark was shorter than its own caption, which reads as an
+            // icon that wandered in from the bar; a hero is the one place the
+            // brand gets to be the brand. Still expressed against a font token
+            // so it tracks a theme that scales type, and MayarIcon's cap ratio
+            // still applies, which is why the multiplier looks large.
+            iconSize: Style.font.display * 1.5
             color: root.bar.foreground
             attention: !root.authenticated
             anchors.left: parent.left
