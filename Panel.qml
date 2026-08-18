@@ -81,17 +81,33 @@ Panel {
     return sign + idr(v)
   }
 
-  readonly property var monthNames: ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun",
-                                     "Jul", "Agu", "Sep", "Okt", "Nov", "Des"]
-
-  function fmtDate(ms) {
+  // What a transaction list is actually scanned for is recency — whether the
+  // payment at the top landed a minute ago or last Tuesday. A wall-clock stamp
+  // makes the reader do that subtraction; "12m ago" is the answer. Only the
+  // coarsest unit is shown, because a second figure adds precision nobody is
+  // reading a bar panel for.
+  //
+  // Reads `nowMs` rather than calling Date.now() so every label re-evaluates
+  // together when the clock below ticks — a function that sampled the time
+  // itself would freeze at whatever the value was when the row was built.
+  function fmtRelative(ms) {
     var t = Number(ms)
     if (!isFinite(t) || t <= 0) return ""
-    var d = new Date(t)
-    if (isNaN(d.getTime())) return ""
-    var pad = function (x) { return x < 10 ? "0" + x : String(x) }
-    return pad(d.getDate()) + " " + monthNames[d.getMonth()] +
-           " " + pad(d.getHours()) + ":" + pad(d.getMinutes())
+    var s = (root.nowMs - t) / 1000
+    // A stamp slightly in the future is clock skew between this machine and
+    // Mayar's, not a scheduled payment, so it reads as new rather than as a
+    // negative age.
+    if (s < 45) return "just now"
+    // Floor, not round: something 90 minutes old is "1h ago", never "2h ago",
+    // which would name a time before it happened. The clamp keeps the first
+    // bucket from rendering as "0m ago".
+    function ago(v, unit) { return Math.max(1, Math.floor(v)) + unit + " ago" }
+    if (s < 3600) return ago(s / 60, "m")
+    if (s < 86400) return ago(s / 3600, "h")
+    if (s < 7 * 86400) return ago(s / 86400, "d")
+    if (s < 30 * 86400) return ago(s / (7 * 86400), "w")
+    if (s < 365 * 86400) return ago(s / (30 * 86400), "mo")
+    return ago(s / (365 * 86400), "y")
   }
 
   // ------------------------------------------------------------- state text
@@ -191,6 +207,21 @@ Panel {
     id: copiedTimer
     interval: 1600
     onTriggered: root.copied = ""
+  }
+
+  // Relative ages go stale on their own, with no new data involved, so the
+  // panel keeps its own clock instead of only re-reading `createdAt` when a
+  // refresh lands. It ticks only while the list is on screen; a closed panel
+  // has nothing whose age is visible. `triggeredOnStart` resets it on open,
+  // so the first frame is never showing an age from the last time it was up.
+  property double nowMs: Date.now()
+
+  Timer {
+    interval: 30000
+    running: root.opened
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.nowMs = Date.now()
   }
 
   implicitWidth: button.implicitWidth
@@ -658,7 +689,7 @@ Panel {
       text: {
         if (!txRow.tx) return ""
         var bits = []
-        var d = root.fmtDate(txRow.tx.createdAt)
+        var d = root.fmtRelative(txRow.tx.createdAt)
         if (d !== "") bits.push(d)
         if (txRow.tx.method) bits.push(String(txRow.tx.method))
         else if (txRow.tx.type) bits.push(String(txRow.tx.type).replace(/_/g, " "))
