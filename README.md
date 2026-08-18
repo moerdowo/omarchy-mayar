@@ -23,6 +23,24 @@ omarchy plugin add https://github.com/moerdowo/omarchy-mayar.git --enable --yes
 No `sudo` and no privilege setup: this plugin reads an HTTP API and touches no
 hardware. The only thing it needs is a key.
 
+## Uninstall
+
+```bash
+~/.config/omarchy/plugins/io.github.moerdowo.mayar/bin/mayarctl logout
+omarchy plugin remove io.github.moerdowo.mayar --yes
+```
+
+Run `logout` first, while the helper still exists — it is what removes the key
+from the keyring, and `plugin remove` deletes the helper along with everything
+else. If the plugin is already gone, `secret-tool clear service mayar account api-key`
+does the same job.
+
+Two things live outside the plugin folder and are not removed with it: the
+response cache at `~/.cache/omarchy-mayar` and, if you used the file fallback
+rather than the keyring, the key at `~/.config/omarchy/mayar/apikey`. Delete
+both to leave nothing behind. Nothing else on the system is touched — there is
+no privilege setup to undo, and no file outside these paths is ever written.
+
 ## Logging in
 
 Mayar has **no login endpoint**. API v2 authenticates with
@@ -136,6 +154,7 @@ Panel.qml         # bar widget + panel — rendering only, no network, no key
 MayarIcon.qml     # the brand mark, as themed Shape paths
 bin/mayarctl      # API, credentials, caching, JSON for the panel
 docs/             # screenshots used by this README
+preview.png       # marketplace listing preview
 ```
 
 ## License
