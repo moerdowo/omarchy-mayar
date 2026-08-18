@@ -254,6 +254,12 @@ Panel {
       waitForEnd: true
       onStreamFinished: {
         root.loading = false
+        // Ages are measured against the moment the data was read, not against
+        // whenever the clock below last ticked. The two are a second or two
+        // apart, which is invisible in the middle of a bucket and wrong at the
+        // edge of one: with floor, a payment exactly three hours old reads
+        // "2h ago" if the clock is even a second behind the response.
+        root.nowMs = Date.now()
         var parsed
         try {
           parsed = JSON.parse(String(text || "{}"))
