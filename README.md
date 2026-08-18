@@ -20,8 +20,8 @@ omarchy plugin add https://github.com/moerdowo/omarchy-mayar.git --enable --yes
 ~/.config/omarchy/plugins/io.github.moerdowo.mayar/bin/mayarctl login
 ```
 
-No `sudo` and no privilege setup: this plugin reads an HTTP API and touches no
-hardware. The only thing it needs is a key.
+This plugin asks for no elevated rights and installs no setup step: it reads an
+HTTP API and touches no hardware. The only thing it needs is a key.
 
 ## Uninstall
 
