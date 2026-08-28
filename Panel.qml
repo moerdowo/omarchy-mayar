@@ -7,12 +7,16 @@ import qs.Commons
 
 // Mayar merchant balance and recent transactions in the bar.
 //
-// Every request and the API key itself live in bin/mayarctl — the panel never
-// opens a socket, never reads the keyring and never sees the key, so the same
-// data is available from a terminal and there is one place where the API
-// contract is implemented. This file only renders what `mayarctl status`
-// prints, which is always one valid JSON object even when offline or logged
-// out.
+// Every request lives in bin/mayarctl — the panel never opens a socket and
+// never reads the keyring, so the same data is available from a terminal and
+// there is one place where the API contract is implemented. This file renders
+// what `mayarctl status` prints, which is always one valid JSON object even
+// when offline or unauthenticated.
+//
+// The one credential this file touches is a key being typed into it, and it
+// only carries it as far as `mayarctl set-key`'s stdin (see setKeyProc). It is
+// never stored here, never put in a process argument, and dropped from the
+// field as soon as the helper says it works.
 Panel {
   id: root
   moduleName: "io.github.moerdowo.mayar"
@@ -32,6 +36,17 @@ Panel {
   property bool stale: false
   property bool loading: false
 
+  // Key entry. `keyMessage` is the one line under the field; `keyOk` only
+  // decides whether it is drawn as prose or as an error, so a success note and
+  // a rejection can share the slot.
+  property bool savingKey: false
+  property string keyMessage: ""
+  property bool keyOk: false
+
+  readonly property bool needsKey: !hasKey || !authenticated
+
+  readonly property color urgent: bar ? bar.urgent : Color.urgent
+
   // Cursor model: the tab chips, then the transaction list.
   readonly property var sections: ["tab", "list"]
   property string focusSection: "tab"
@@ -46,6 +61,70 @@ Panel {
   ]
 
   readonly property var rows: tab === "unpaid" ? root.unpaid : root.paid
+
+  // ----------------------------------------------------------- sanitising
+
+  // Everything mayarctl returns except the balance figures is API-controlled,
+  // and some of it is controlled by strangers: a customer types their own name
+  // at checkout, and an error string is whatever Mayar's server chose to send.
+  //
+  // QML Text defaults to Text.AutoText, which runs Qt.mightBeRichText() over
+  // the string and hands anything that looks like markup to the StyledText
+  // parser — and StyledText honours <img src="https://…"> by fetching it. A
+  // customer named `<img src=https://tracker.example/x.png>` would then have
+  // every panel that renders that row phone home on its own: the merchant's IP
+  // address, the fact that they run this widget, and the moment they opened it.
+  // Nothing needs to be clicked.
+  //
+  // Every Text below sets textFormat: Text.PlainText, which is the real fix.
+  // Strings are also stripped here, because two paths leave this file: the bar
+  // tooltip is laid out by the shell's PanelToolTip, whose Text this plugin
+  // does not own, and anything a future shared component renders would inherit
+  // the same default. Angle brackets go because no tag can begin without one;
+  // control characters go because one row is one line; the length is clamped
+  // because a name is not a payload.
+  function sanitise(v) {
+    if (v === null || v === undefined) return ""
+    return String(v)
+      .replace(/[<>]/g, "")
+      .replace(/[\x00-\x1f\x7f-\x9f]/g, " ")
+      .slice(0, 160)
+      .trim()
+  }
+
+  // For the two fields that are copied rather than drawn — a payment URL and a
+  // transaction id. Clamping these to 160 characters the way a label is clamped
+  // would hand someone a silently truncated URL, which is worse than a long
+  // one, so only the characters that could confuse a clipboard or a terminal
+  // come out.
+  function sanitiseOpaque(v) {
+    if (v === null || v === undefined) return ""
+    return String(v).replace(/[\x00-\x1f\x7f-\x9f]/g, "").slice(0, 2048)
+  }
+
+  // Rows are rebuilt field by field rather than patched, so a field added to
+  // mayarctl later cannot reach a Text without being named here first.
+  function sanitiseRows(rows) {
+    if (!Array.isArray(rows)) return []
+    var out = []
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i] || {}
+      out.push({
+        id: sanitiseOpaque(r.id),
+        kind: sanitise(r.kind),
+        amount: Number(r.amount) || 0,
+        status: sanitise(r.status),
+        createdAt: Number(r.createdAt) || 0,
+        method: sanitise(r.method),
+        type: sanitise(r.type),
+        customer: sanitise(r.customer),
+        label: sanitise(r.label),
+        url: sanitiseOpaque(r.url),
+        fee: Number(r.fee) || 0
+      })
+    }
+    return out
+  }
 
   // ------------------------------------------------------------ formatting
 
@@ -113,7 +192,7 @@ Panel {
   // ------------------------------------------------------------- state text
 
   readonly property string statusLine: {
-    if (!hasKey) return "NEEDS LOGIN"
+    if (!hasKey) return "NEEDS KEY"
     if (!authenticated) return "KEY REJECTED"
     if (balance === null) return lastError !== "" ? "OFFLINE" : "…"
     var s = idrShort(balance.balanceActive)
@@ -180,6 +259,28 @@ Panel {
     root.selectedIndex = 0
   }
 
+  // Hands the key to mayarctl and forgets it here. The field keeps its text
+  // until the helper says the key works, so a rejected key can be corrected
+  // rather than re-pasted; on success both copies are dropped and the only one
+  // left anywhere is the one in the keyring.
+  function submitKey(k) {
+    var key = String(k || "").replace(/\s/g, "")
+    if (key === "" || root.savingKey) return
+    root.savingKey = true
+    root.keyOk = false
+    root.keyMessage = "Verifying…"
+    setKeyProc.gotResult = false
+    setKeyProc.secret = key
+    setKeyProc.running = true
+  }
+
+  function forgetKey() {
+    if (forgetProc.running) return
+    root.keyMessage = ""
+    root.keyOk = false
+    forgetProc.running = true
+  }
+
   function refresh(force) {
     if (statusProc.running) return
     root.loading = true
@@ -235,6 +336,11 @@ Panel {
       focusSection = "tab"
       selectedIndex = 0
       cursorActive = false
+    } else {
+      // Nothing about a half-typed key should survive the panel closing.
+      keyField.text = ""
+      keyMessage = ""
+      keyOk = false
     }
   }
 
@@ -270,14 +376,14 @@ Panel {
         }
         root.hasKey = !!parsed.hasKey
         root.authenticated = !!parsed.authenticated
-        root.source = String(parsed.source || "none")
-        root.env = String(parsed.env || "production")
+        root.source = root.sanitise(parsed.source) || "none"
+        root.env = parsed.env === "sandbox" ? "sandbox" : "production"
         root.keyringAvailable = !!parsed.keyringAvailable
         root.balance = parsed.balance || null
-        root.paid = parsed.paid || []
-        root.unpaid = parsed.unpaid || []
+        root.paid = root.sanitiseRows(parsed.paid)
+        root.unpaid = root.sanitiseRows(parsed.unpaid)
         root.stale = !!parsed.stale
-        root.lastError = parsed.error ? String(parsed.error) : ""
+        root.lastError = root.sanitise(parsed.error)
       }
     }
     onRunningChanged: if (!running) root.loading = false
@@ -287,6 +393,74 @@ Panel {
     id: copyProc
     stdout: StdioCollector { waitForEnd: true }
     stderr: StdioCollector { waitForEnd: true }
+  }
+
+  // The key reaches mayarctl on stdin, never as an argument: /proc/<pid>/cmdline
+  // is world-readable, so anything in argv is readable by every other user on
+  // the machine for as long as the process lives. This is the same reason the
+  // shell's own network panel pipes an 802.1X password to nmcli rather than
+  // passing it. stdin is closed straight after the write so the `read` on the
+  // other side returns instead of blocking on a pipe nobody will write to again.
+  Process {
+    id: setKeyProc
+    property string secret: ""
+    // Set when stdout has been parsed, so onExited can tell "the helper
+    // answered" from "the helper never ran" and not leave Verifying… on screen.
+    property bool gotResult: false
+
+    command: [root.mayarctl, "set-key"]
+    stdinEnabled: true
+
+    onStarted: {
+      write(secret + "\n")
+      secret = ""
+      stdinEnabled = false
+    }
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        setKeyProc.gotResult = true
+        root.savingKey = false
+        var res
+        try {
+          res = JSON.parse(String(text || "{}"))
+        } catch (e) {
+          res = {}
+        }
+        if (res.ok) {
+          root.keyOk = true
+          // Storing a key that MAYAR_API_KEY then overrides looks exactly like
+          // storing one that did nothing, so say which one is actually in use.
+          root.keyMessage = res.shadowed
+            ? "Stored — but MAYAR_API_KEY is set in the environment and outranks the keyring, so that key is still the one being used."
+            : ""
+          keyField.text = ""
+          keyCatcher.forceActiveFocus()
+          root.refresh(true)
+        } else {
+          root.keyOk = false
+          root.keyMessage = root.sanitise(res.error) || "Could not store the key."
+        }
+      }
+    }
+
+    stderr: StdioCollector { waitForEnd: true }
+
+    onExited: {
+      if (setKeyProc.gotResult) return
+      root.savingKey = false
+      root.keyOk = false
+      root.keyMessage = "mayarctl did not answer."
+    }
+  }
+
+  Process {
+    id: forgetProc
+    command: [root.mayarctl, "logout"]
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: root.refresh(true)
   }
 
   BarIconButton {
@@ -312,7 +486,7 @@ Panel {
       }
     }
     tooltipText: {
-      if (!root.hasKey) return "Mayar · not logged in"
+      if (!root.hasKey) return "Mayar · no API key"
       if (!root.authenticated) return "Mayar · API key rejected"
       if (root.balance === null) return "Mayar · " + (root.lastError !== "" ? root.lastError : "loading")
       var t = "Mayar · " + root.idr(root.balance.balanceActive) + " available"
@@ -330,13 +504,25 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    focusTarget: keyCatcher
+    // With no key there is nothing else in the panel to do, so the field is
+    // what the panel hands focus to on open. KeyboardPanel forces focus onto
+    // this target through its own Qt.callLater when it opens, which lands
+    // after anything the field could schedule for itself — so the field has to
+    // be the target rather than try to take focus back afterwards. A rejected
+    // key still leaves a balance and rows worth walking, so that case keeps the
+    // cursor on the key catcher.
+    focusTarget: !root.hasKey && root.keyringAvailable ? keyField : keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(400))
     contentHeight: panel.fittedContentHeight(panelColumn.implicitHeight, Style.space(560))
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      // While the key field has focus it owns every keystroke — otherwise a
+      // key containing a j or a k would walk the transaction list instead of
+      // being typed into the field.
+      blocked: keyField.activeFocus
+
       onMoveRequested: function (dx, dy) {
         if (!root.cursorActive) {
           root.cursorActive = true
@@ -385,6 +571,7 @@ Panel {
             spacing: Style.space(2)
 
             Text {
+              textFormat: Text.PlainText
               text: "MAYAR"
               color: root.bar.foreground
               font.family: root.bar.fontFamily
@@ -395,6 +582,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               text: root.statusLine
               color: Qt.darker(root.bar.foreground, 1.4)
               font.family: root.bar.fontFamily
@@ -407,28 +595,100 @@ Panel {
           }
         }
 
-        // ---------- Login notice ----------
+        // ---------- Key entry ----------
+        //
+        // There is nothing to log in to: API v2 takes an API key and nothing
+        // else, so the key is typed here rather than in a terminal. It goes to
+        // `mayarctl set-key` on stdin (see setKeyProc), which verifies it
+        // against /balances before storing it in the login keyring — a key that
+        // was never going to work does not get saved and then reported as
+        // rejected on every poll afterwards.
         PanelSeparator {
-          visible: !root.hasKey || !root.authenticated
+          visible: root.needsKey
           foreground: root.bar.foreground
         }
 
-        Text {
-          visible: !root.hasKey || !root.authenticated
+        Column {
+          visible: root.needsKey
           width: parent.width
-          wrapMode: Text.WordWrap
-          text: {
-            var cmd = "~/.config/omarchy/plugins/io.github.moerdowo.mayar/bin/mayarctl login"
-            if (!root.hasKey)
-              return "No API key yet. In a terminal, run:\n\n" + cmd +
-                     "\n\nIt asks for a key once and stores it in your login keyring. " +
-                     "Or export MAYAR_API_KEY instead if you'd rather not use the keyring."
-            return "Mayar rejected the key from " + root.sourceLabel +
-                   ". Create a new one at web.mayar.id → Integrasi › Api Keys, then run:\n\n" + cmd
+          spacing: Style.space(8)
+
+          Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            text: {
+              if (!root.keyringAvailable)
+                return "No keyring on this machine — secret-tool, from libsecret, is not installed, " +
+                       "so there is nowhere safe to put a key. Set MAYAR_API_KEY in the environment instead."
+              if (root.hasKey)
+                return "Mayar rejected the key from " + root.sourceLabel +
+                       ". Create a new one at web.mayar.id → Integrasi › Api Keys and paste it here."
+              return "Paste an API key from web.mayar.id → Integrasi › Api Keys. " +
+                     "A Read Only key is enough — this widget never issues a POST. " +
+                     "It is checked against your balance, then stored in your login keyring."
+            }
+            color: root.keyringAvailable ? Qt.darker(root.bar.foreground, 1.2) : root.urgent
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
           }
-          color: Qt.darker(root.bar.foreground, 1.2)
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.caption
+
+          Item {
+            visible: root.keyringAvailable
+            width: parent.width
+            // The button is a fixed square and the field is sized from its
+            // font; whichever wins has to be the row height, or the shorter
+            // measurement lets the other one draw outside it.
+            implicitHeight: Math.max(keyField.implicitHeight, saveKeyButton.implicitHeight)
+
+            TextField {
+              id: keyField
+              anchors.left: parent.left
+              anchors.right: saveKeyButton.left
+              anchors.rightMargin: Style.space(6)
+              anchors.verticalCenter: parent.verticalCenter
+              password: true
+              placeholderText: root.savingKey ? "Verifying…" : "Mayar API key"
+              enabled: !root.savingKey
+              foreground: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.body
+              horizontalPadding: Style.spacing.controlGap
+              verticalPadding: Style.spacing.controlPaddingY
+
+              onAccepted: root.submitKey(text)
+              // Whatever the line below says stopped being true the moment the
+              // key changed; clear a stale rejection before it misreads as a
+              // verdict on what is being typed now.
+              onTextChanged: if (root.keyMessage !== "" && !root.savingKey) root.keyMessage = ""
+              // Esc hands input back to the panel's own key handling, so the
+              // second Esc closes the panel the way it does everywhere else.
+              Keys.onEscapePressed: keyCatcher.forceActiveFocus()
+            }
+
+            PanelActionButton {
+              id: saveKeyButton
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              enabled: !root.savingKey && keyField.text.length > 0
+              iconText: "󰄬"
+              tooltipText: "Verify and store this key"
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              onClicked: root.submitKey(keyField.text)
+            }
+          }
+
+          Text {
+            visible: root.keyMessage !== ""
+            width: parent.width
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            text: root.keyMessage
+            color: root.keyOk ? Qt.darker(root.bar.foreground, 1.2) : root.urgent
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+          }
         }
 
         // ---------- Balance ----------
@@ -510,6 +770,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: root.rows.length === 0
             width: parent.width
             wrapMode: Text.WordWrap
@@ -579,10 +840,15 @@ Panel {
         Item {
           visible: root.hasKey
           width: parent.width
-          implicitHeight: footLeft.implicitHeight + Style.space(4)
+          // Was one line of caption text; the forget button is taller than
+          // that, and nothing clips this row, so measure from whichever is
+          // bigger rather than letting the button draw past the border.
+          implicitHeight: Math.max(footLeft.implicitHeight + Style.space(4),
+                                   forgetKeyButton.visible ? forgetKeyButton.implicitHeight : 0)
 
           Text {
             id: footLeft
+            textFormat: Text.PlainText
             text: root.copied !== "" ? "COPIED" : ("KEY · " + root.sourceLabel.toUpperCase())
             color: Qt.darker(root.bar.foreground, 1.4)
             font.family: root.bar.fontFamily
@@ -591,7 +857,31 @@ Panel {
             anchors.bottom: parent.bottom
           }
 
+          // The key is entered in this panel, so it can be removed from it too.
+          // Shown only for a key this button could actually remove: MAYAR_API_KEY
+          // lives in the environment and the config file is a file, and a button
+          // that silently failed to clear either would be worse than none.
+          PanelActionButton {
+            id: forgetKeyButton
+            visible: root.source === "keyring"
+            enabled: !forgetProc.running
+            // The same mark the shell's own wifi panel uses for "forget this
+            // network", rather than a second glyph for the same idea.
+            iconText: "󰅙"
+            tooltipText: "Forget the stored key"
+            foreground: Qt.darker(root.bar.foreground, 1.4)
+            hoverColor: root.urgent
+            fontFamily: root.bar.fontFamily
+            fontSize: Style.font.body
+            anchors.right: envLabel.left
+            anchors.rightMargin: Style.space(8)
+            anchors.verticalCenter: envLabel.verticalCenter
+            onClicked: root.forgetKey()
+          }
+
           Text {
+            id: envLabel
+            textFormat: Text.PlainText
             // Sandbox and production are different accounts with different
             // money in them; never let the panel be ambiguous about which.
             text: root.env === "sandbox" ? "SANDBOX" : "PRODUCTION"
@@ -619,6 +909,7 @@ Panel {
     implicitHeight: balLabel.implicitHeight + Style.space(8)
 
     Text {
+      textFormat: Text.PlainText
       id: balLabel
       text: balRow.label
       color: Qt.darker(root.bar.foreground, balRow.emphasised ? 1.0 : 1.4)
@@ -629,6 +920,7 @@ Panel {
     }
 
     Text {
+      textFormat: Text.PlainText
       text: balRow.value
       color: root.bar.foreground
       font.family: root.bar.fontFamily
@@ -672,6 +964,7 @@ Panel {
     }
 
     Text {
+      textFormat: Text.PlainText
       id: txTop
       // Whoever paid is the thing being scanned for; the product name is the
       // fallback when a transaction has no customer attached.
@@ -687,6 +980,7 @@ Panel {
     }
 
     Text {
+      textFormat: Text.PlainText
       text: txRow.tx ? root.idr(txRow.tx.amount) : ""
       color: root.bar.foreground
       font.family: root.bar.fontFamily
@@ -698,6 +992,7 @@ Panel {
     }
 
     Text {
+      textFormat: Text.PlainText
       id: txBottom
       text: {
         if (!txRow.tx) return ""
@@ -718,6 +1013,7 @@ Panel {
     }
 
     Text {
+      textFormat: Text.PlainText
       // Paid rows say settled/pending; unpaid rows say active/expired. Both
       // matter, and neither is inferable from the amount.
       text: txRow.tx ? String(txRow.tx.status || "").toUpperCase() : ""

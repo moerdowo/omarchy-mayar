@@ -10,18 +10,28 @@
 #   mayarctl balance             print JSON balance
 #   mayarctl paid   [-n N]       print JSON paid transactions
 #   mayarctl unpaid [-n N]       print JSON unpaid transactions
-#   mayarctl login               store an API key in the keyring, interactively
+#   mayarctl set-key             read a key on stdin, verify it, store it
 #   mayarctl logout              remove the stored key
 #   mayarctl auth                print JSON describing where the key comes from
 #   mayarctl refresh             drop the response cache
 #
-# On "login": Mayar has no merchant login endpoint. API v2 authenticates with
-# `Authorization: Bearer <api-key>` and nothing else — the only login in the
-# docs is a magic link that logs your *customers* into their portal. So `login`
-# is not an OAuth exchange; it prompts for the key once, verifies it against
-# /balances, and puts it in the login keyring so it never sits in a dotfile.
+# On credentials: Mayar has no merchant login endpoint. API v2 authenticates
+# with `Authorization: Bearer <api-key>` and nothing else — the only login in
+# the docs is a magic link that logs your *customers* into their portal. So
+# there is nothing to log in to and no `login` command: the key is typed into
+# the panel, which pipes it to `set-key`, which verifies it against /balances
+# and puts it in the login keyring so it never sits in a dotfile. `set-key`
+# reads stdin and prompts for nothing, so it is equally usable headlessly:
+#
+#   printf %s "$KEY" | mayarctl set-key
+#
 # The api-key path (MAYAR_API_KEY, or the config file) stays available for
-# headless use where no keyring is unlocked.
+# machines where no keyring is unlocked.
+#
+# The key is never a command-line argument — not to this script, and not to
+# curl. /proc/<pid>/cmdline is world-readable, so an argument is readable by
+# every user on the machine for as long as the process lives; curl gets the
+# Authorization header from a config file on stdin instead.
 
 # No `set -e`. The panel polls `status` and renders whatever JSON comes back;
 # a failed API call is a state to report, not a reason to exit and hand the
@@ -67,14 +77,21 @@ key_source=""
 api_key() {
   local k
 
+  # Whitespace is stripped from every source, not just the file: a key pasted
+  # with a trailing newline is the same key, and a stray newline would break
+  # the curl config line the header is written on below.
   if [[ -n ${MAYAR_API_KEY:-} ]]; then
-    key_source=env
-    printf '%s' "$MAYAR_API_KEY"
-    return 0
+    k=${MAYAR_API_KEY//[[:space:]]/}
+    if [[ -n $k ]]; then
+      key_source=env
+      printf '%s' "$k"
+      return 0
+    fi
   fi
 
   if command -v secret-tool >/dev/null 2>&1; then
     k=$(secret-tool lookup service "$SERVICE" account "$ACCOUNT" 2>/dev/null)
+    k=${k//[[:space:]]/}
     if [[ -n $k ]]; then
       key_source=keyring
       printf '%s' "$k"
@@ -83,7 +100,8 @@ api_key() {
   fi
 
   if [[ -r $CONFIG_FILE ]]; then
-    k=$(tr -d '[:space:]' <"$CONFIG_FILE")
+    k=$(<"$CONFIG_FILE")
+    k=${k//[[:space:]]/}
     if [[ -n $k ]]; then
       key_source=file
       printf '%s' "$k"
@@ -95,52 +113,58 @@ api_key() {
   return 1
 }
 
-do_login() {
-  local key resp code
+# Reads the key on stdin — never an argument — verifies it against /balances,
+# and only then stores it in the login keyring. Prints one JSON object either
+# way so the panel can tell "stored" from "rejected" without parsing prose.
+#
+# Verifying first matters: a key that was never going to work should not land
+# in the keyring, where the panel would report it as rejected on every poll
+# from then on with nothing to point at.
+do_set_key() {
+  local key resp code saved
 
-  command -v secret-tool >/dev/null 2>&1 ||
-    die "secret-tool not installed — set MAYAR_API_KEY or write the key to $CONFIG_FILE instead"
+  IFS= read -r key || true
+  key=${key//[[:space:]]/}
+  if [[ -z $key ]]; then
+    jq -nc '{ok:false,error:"no key given"}'
+    return 1
+  fi
 
-  cat <<'EOF'
-Mayar has no login endpoint — API v2 authenticates with an API key only.
-Create one at:
+  if ! command -v secret-tool >/dev/null 2>&1; then
+    jq -nc --arg f "$CONFIG_FILE" \
+      '{ok:false,error:("secret-tool is not installed — set MAYAR_API_KEY, or write the key to " + $f)}'
+    return 1
+  fi
 
-  production  https://web.mayar.id/integration/apikey
-  sandbox     https://web.mayar.io/integration/apikey
-
-A Read Only key is enough for this plugin; it never issues a POST.
-
-EOF
-
-  # -s so the key does not land in the scrollback or, worse, the shell history
-  # of whoever is watching.
-  read -rsp "Paste your Mayar API key: " key
-  echo
-  key=$(printf '%s' "$key" | tr -d '[:space:]')
-  [[ -n $key ]] || die "no key entered"
-
-  echo "Verifying against ${API_BASE}/balances ..."
   # Set it in this shell rather than as a `VAR=x func` prefix: bash scopes such
   # a prefix to the function only outside POSIX mode, which is a difference the
   # verification step should not depend on.
-  local saved=${MAYAR_API_KEY:-}
+  saved=${MAYAR_API_KEY:-}
   MAYAR_API_KEY="$key"
   resp=$(api_get "/balances")
   code=$?
   MAYAR_API_KEY=$saved
   [[ -z $saved ]] && unset MAYAR_API_KEY
+
   if ((code != 0)); then
-    echo "$resp" | jq -r '.error // "request failed"' >&2
-    die "key rejected — nothing was stored"
+    jq -nc --arg e "$(jq -r '.error // "request failed"' <<<"$resp" 2>/dev/null)" \
+      '{ok:false,error:$e}'
+    return 1
   fi
 
-  printf '%s' "$key" |
-    secret-tool store --label="Mayar API key" service "$SERVICE" account "$ACCOUNT" ||
-    die "could not write to the keyring"
+  # secret-tool takes the value on stdin, so the key is not in its argv either.
+  if ! printf '%s' "$key" |
+    secret-tool store --label="Mayar API key" service "$SERVICE" account "$ACCOUNT"; then
+    jq -nc '{ok:false,error:"could not write to the keyring"}'
+    return 1
+  fi
 
   rm -rf "$CACHE_DIR"
-  echo "Stored in the login keyring. Balance reads:"
-  echo "$resp" | jq -r '.data | "  active  \(.balanceActive)\n  pending \(.balancePending)\n  total   \(.balance)"'
+  # `shadowed` is not a failure: the key was stored, but MAYAR_API_KEY outranks
+  # the keyring, so the panel would keep reading the old one and look like the
+  # save silently did nothing. It says so instead.
+  jq -nc --argjson shadowed "$([[ -n ${MAYAR_API_KEY:-} ]] && echo true || echo false)" \
+    '{ok:true, source:"keyring", shadowed:$shadowed}'
 }
 
 do_logout() {
@@ -166,21 +190,32 @@ do_logout() {
 # Echoes a JSON body on success. On failure echoes {"error": "..."} and returns
 # non-zero, so callers can distinguish the two without parsing prose.
 api_get() {
-  local path=$1 key body http sep
+  local path=$1 key body http sep esc
   key=$(api_key) || {
     echo '{"error":"no API key"}'
     return 1
   }
 
+  # The key reaches curl through a config file on stdin, never through argv.
+  # /proc/<pid>/cmdline is world-readable, so `-H "Authorization: Bearer ..."`
+  # publishes the key to every user on the machine for as long as the request
+  # runs — a `ps` or a read of /proc at the right moment is the whole attack.
+  # printf is a bash builtin, so writing the config spawns no process carrying
+  # it either. Backslashes and quotes are escaped because curl unescapes them
+  # inside a quoted config value; a Mayar key contains neither, but the
+  # escaping is what makes that not need to be true.
+  esc=${key//\\/\\\\}
+  esc=${esc//\"/\\\"}
+
   # -w appends the status after the body; split on a separator that cannot
   # appear in JSON so a body containing newlines still parses.
   sep=$'\x1e'
-  body=$(curl -sS \
-    --connect-timeout 5 --max-time 15 \
-    -H "Authorization: Bearer ${key}" \
-    -H "Accept: application/json" \
-    -w "${sep}%{http_code}" \
-    "${API_BASE}${path}" 2>&1)
+  body=$(printf 'header = "Authorization: Bearer %s"\n' "$esc" |
+    curl -sS --config - \
+      --connect-timeout 5 --max-time 15 \
+      -H "Accept: application/json" \
+      -w "${sep}%{http_code}" \
+      "${API_BASE}${path}" 2>&1)
 
   if [[ $body != *"$sep"* ]]; then
     # curl failed before it got a response — the message is the whole output.
@@ -195,8 +230,8 @@ api_get() {
     local msg
     msg=$(echo "$body" | jq -r '.messages // .message // empty' 2>/dev/null)
     [[ -n $msg ]] || msg="HTTP $http"
-    # 401 is the one worth naming, because it means "re-run login", not
-    # "try again later".
+    # 401 is the one worth naming, because it means "the key needs replacing",
+    # not "try again later".
     [[ $http == 401 || $http == 403 ]] && msg="unauthorized — check the API key ($msg)"
     jq -nc --arg m "$msg" --argjson s "$http" '{error:$m,status:$s}'
     return 1
@@ -229,7 +264,9 @@ cached_get() {
   body=$(api_get "$path")
   if (($? == 0)); then
     mkdir -p "$CACHE_DIR" && chmod 700 "$CACHE_DIR" 2>/dev/null
-    printf '%s' "$body" >"$file.tmp" && mv "$file.tmp" "$file"
+    # Cached bodies carry customer names and amounts. The directory is 700, but
+    # the file is created under a umask of the caller's choosing — so pick one.
+    (umask 077 && printf '%s' "$body" >"$file.tmp") && mv "$file.tmp" "$file"
     printf '%s' "$body"
     return 0
   fi
@@ -397,11 +434,11 @@ balance) cmd_balance ;;
 paid) cmd_paid "$limit" ;;
 unpaid) cmd_unpaid "$limit" ;;
 auth) cmd_auth ;;
-login) do_login ;;
+set-key | setkey) do_set_key ;;
 logout) do_logout ;;
 refresh)
   rm -rf "$CACHE_DIR"
   echo "cache dropped"
   ;;
-*) die "unknown command '$cmd' — try status, balance, paid, unpaid, auth, login, logout, refresh" ;;
+*) die "unknown command '$cmd' — try status, balance, paid, unpaid, auth, set-key, logout, refresh" ;;
 esac
