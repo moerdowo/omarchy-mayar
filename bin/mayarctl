@@ -49,6 +49,16 @@ CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-mayar"
 # docs do not publish — so the widget's cadence is decoupled from the API's.
 CACHE_TTL="${MAYAR_CACHE_TTL:-60}"
 
+# Ceiling on a single API response. A body is held in a shell variable, walked
+# by jq several times, written to the cache and finally collected in QML, so an
+# unbounded response is unbounded memory in four places at once — and the row
+# limits in the panel only apply long after all of that. Real Mayar payloads are
+# single-digit kilobytes; 256 KiB is room to spare and still small enough that a
+# hostile or broken endpoint cannot matter.
+MAX_BYTES="${MAYAR_MAX_BYTES:-262144}"
+[[ $MAX_BYTES =~ ^[0-9]+$ ]] && ((MAX_BYTES >= 1024 && MAX_BYTES <= 8388608)) ||
+  MAX_BYTES=262144
+
 # Sandbox keys only work against api.mayar.io, production keys only against
 # api.mayar.id. Selected by environment so a single install can be pointed at
 # either without editing anything.
@@ -65,6 +75,77 @@ die() {
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required command '$1'"; }
 need curl
 need jq
+
+# ----------------------------------------------------------------- safe paths
+#
+# Every path this script reads or writes is one another process could have got
+# to first. A symlink where the key file is expected sends whatever it points at
+# into an Authorization header; a FIFO there wedges the bar on a read that never
+# returns; a symlink in the cache directory turns a cache write into a write to
+# a file of someone else's choosing. Plain `[[ -r ]]`, `$(<file)`, `cat` and a
+# predictable `$file.tmp` do none of the checking that would notice.
+#
+# Two rules close all three, and they only work as a pair:
+#
+#   1. every directory on the way to a path must be a real directory owned by
+#      this user or root and writable by nobody else. That is what makes rule 2
+#      safe to trust rather than a race: in a directory no one else can write,
+#      no one else can swap the entry between the test and the open.
+#
+#   2. the entry itself must be a regular file owned by this user, established
+#      with lstat — `find -type f` does not follow symlinks — rather than with
+#      `[[ -f ]]`, which follows one and answers about the target.
+#
+# Bash has no redirection that opens O_NOFOLLOW|O_NONBLOCK, so rule 2 is what
+# stands in for those flags: a symlink or a FIFO matches nothing, and the open
+# that could have followed or blocked is never reached.
+
+me_uid=$(id -u)
+
+# Walks the resolved path upwards. Resolving first matters: the components
+# tested here are then the ones the kernel will actually traverse, where testing
+# the unresolved spelling would test names a symlink component makes irrelevant.
+dir_is_private() {
+  local d uid mode
+  d=$(realpath -m -- "$1" 2>/dev/null) || return 1
+  while :; do
+    [[ -d $d && ! -L $d ]] || return 1
+    read -r uid mode < <(stat -c '%u %a' -- "$d" 2>/dev/null) || return 1
+    [[ $uid == "$me_uid" || $uid == 0 ]] || return 1
+    ((8#$mode & 8#22)) && return 1
+    [[ $d == / ]] && return 0
+    d=${d%/*}
+    [[ -n $d ]] || d=/
+  done
+}
+
+# True when $1 names a regular file that only this user could have put there.
+is_private_file() {
+  local path=$1 dir=${1%/*} base=${1##*/} extra=${2:-}
+  [[ $dir == "$path" ]] && dir=.
+  dir_is_private "$dir" || return 1
+  [[ -n $(find "$dir" -maxdepth 1 -mindepth 1 -name "$base" \
+    -type f -uid "$me_uid" $extra -print -quit 2>/dev/null) ]]
+}
+
+# The key. Read in-shell so the secret never crosses a process boundary it does
+# not have to, and capped with `read -N` so a file of surprising size cannot
+# pull more than 4 KiB in. A group- or world-writable key file is refused
+# outright: anyone who can rewrite it can choose which server the key goes to.
+read_private_key() {
+  local path=$1 content=""
+  is_private_file "$path" '! -perm /022' || return 1
+  IFS= read -r -N 4096 content <"$path" 2>/dev/null
+  printf '%s' "$content"
+}
+
+# Cached JSON. Larger, so `head -c` does the reading and the capping in one go
+# rather than bash pulling it in a character at a time.
+read_private_capped() {
+  local path=$1 max=$2
+  is_private_file "$path" || return 1
+  head -c "$max" -- "$path" 2>/dev/null
+}
 
 # ---------------------------------------------------------------- credentials
 
@@ -99,8 +180,7 @@ api_key() {
     fi
   fi
 
-  if [[ -r $CONFIG_FILE ]]; then
-    k=$(<"$CONFIG_FILE")
+  if k=$(read_private_key "$CONFIG_FILE"); then
     k=${k//[[:space:]]/}
     if [[ -n $k ]]; then
       key_source=file
@@ -159,7 +239,7 @@ do_set_key() {
     return 1
   fi
 
-  rm -rf "$CACHE_DIR"
+  cache_drop
   # `shadowed` is not a failure: the key was stored, but MAYAR_API_KEY outranks
   # the keyring, so the panel would keep reading the old one and look like the
   # save silently did nothing. It says so instead.
@@ -172,13 +252,13 @@ do_logout() {
   if command -v secret-tool >/dev/null 2>&1; then
     secret-tool clear service "$SERVICE" account "$ACCOUNT" 2>/dev/null && cleared=1
   fi
-  rm -rf "$CACHE_DIR"
+  cache_drop
   if ((cleared)); then
     echo "Removed the stored key and dropped the cache."
   else
     echo "No key was stored in the keyring; dropped the cache."
   fi
-  [[ -r $CONFIG_FILE ]] &&
+  [[ -e $CONFIG_FILE || -L $CONFIG_FILE ]] &&
     echo "Note: $CONFIG_FILE still exists and will still be used. Delete it too if you meant to."
   [[ -n ${MAYAR_API_KEY:-} ]] &&
     echo "Note: MAYAR_API_KEY is set in this environment and takes precedence."
@@ -210,15 +290,42 @@ api_get() {
   # -w appends the status after the body; split on a separator that cannot
   # appear in JSON so a body containing newlines still parses.
   sep=$'\x1e'
+
+  # Deadlines bound how long a response may take; they say nothing about how
+  # big it may be, and this body is about to be held in a variable, walked by
+  # jq, cached and shipped to the panel. Two ceilings, because one of them can
+  # be lied to:
+  #
+  #   --max-filesize refuses a body whose Content-Length already says it is too
+  #   big, so the usual oversized response is never transferred at all; and
+  #
+  #   head -c is the one that cannot be talked out of it. It closes the pipe the
+  #   moment the ceiling is reached and curl dies of SIGPIPE, so this shell holds
+  #   at most MAX_BYTES + 1 bytes whatever the server does — chunked, lying about
+  #   its length, or streaming for the whole --max-time window.
+  #
+  # The +1 is what makes "too big" detectable rather than silently truncated: a
+  # body at exactly the ceiling still leaves a byte for the overrun to show up in.
   body=$(printf 'header = "Authorization: Bearer %s"\n' "$esc" |
     curl -sS --config - \
+      --proto '=https' \
       --connect-timeout 5 --max-time 15 \
+      --max-filesize "$MAX_BYTES" \
       -H "Accept: application/json" \
       -w "${sep}%{http_code}" \
-      "${API_BASE}${path}" 2>&1)
+      "${API_BASE}${path}" 2>&1 |
+    head -c "$((MAX_BYTES + 1))")
+
+  # Bytes, not characters: ${#body} would measure a multibyte body short.
+  if (($(printf '%s' "$body" | wc -c) > MAX_BYTES)); then
+    jq -nc --argjson n "$MAX_BYTES" \
+      '{error:("response was larger than " + ($n | tostring) + " bytes — refused")}'
+    return 1
+  fi
 
   if [[ $body != *"$sep"* ]]; then
     # curl failed before it got a response — the message is the whole output.
+    # `--max-filesize` tripping lands here too, which is the right place for it.
     jq -nc --arg m "${body:-network error}" '{error:$m}'
     return 1
   fi
@@ -245,37 +352,88 @@ api_get() {
   printf '%s' "$body"
 }
 
+# Cached bodies carry customer names and amounts, so the cache gets a directory
+# nothing else can write to — and the directory is verified after it is created,
+# not merely created: `mkdir -p` is perfectly happy to accept a directory, or a
+# symlink to one, that somebody else put there first. A cache that cannot be
+# made private is not used at all; every read below then simply misses and the
+# panel goes to the network, which is slower and still correct.
+cache_ok=""
+
+cache_ready() {
+  [[ -n $cache_ok ]] && return "$cache_ok"
+  cache_ok=1
+  mkdir -p -m 700 -- "$CACHE_DIR" 2>/dev/null
+  if [[ -d $CACHE_DIR && ! -L $CACHE_DIR ]] && chmod 700 -- "$CACHE_DIR" 2>/dev/null &&
+    dir_is_private "$CACHE_DIR"; then
+    cache_ok=0
+    # A helper killed mid-write — by its own deadline, or by the panel's —
+    # leaves its mktemp file behind. Sweep the stragglers rather than letting
+    # them accumulate for the life of the install.
+    find "$CACHE_DIR" -maxdepth 1 -type f -name '*.json.??????????' \
+      -mmin +60 -delete 2>/dev/null
+  fi
+  return "$cache_ok"
+}
+
+# `rm` never follows the argument itself, so a symlink left in place of the
+# cache directory loses the link rather than what it points at.
+cache_drop() {
+  rm -rf -- "$CACHE_DIR"
+  cache_ok=""
+}
+
+# mktemp names the temporary file, in the same directory as its target, so there
+# is no predictable `$file.tmp` for a preplaced symlink to aim at — and it
+# creates it 0600 rather than at the caller's umask. `mv` then renames over the
+# target, which replaces a symlink sitting there instead of writing through it.
+cache_store() {
+  local file=$1 data=$2 tmp
+  cache_ready || return 1
+  tmp=$(mktemp -- "$file.XXXXXXXXXX" 2>/dev/null) || return 1
+  if printf '%s' "$data" >"$tmp" && mv -f -- "$tmp" "$file"; then
+    return 0
+  fi
+  rm -f -- "$tmp"
+  return 1
+}
+
 # api_get through a TTL cache, keyed by path. A stale entry is preferred over
 # an error: if the request fails and something cached exists, the panel keeps
 # showing the last known numbers instead of blanking out.
 cached_get() {
-  local path=$1 slug file age body
+  local path=$1 slug file age body cached=""
   slug=$(printf '%s' "${MAYAR_ENV:-production}$path" | tr -c 'a-zA-Z0-9' '_')
   file="$CACHE_DIR/$slug.json"
 
-  if [[ ${FORCE:-0} != 1 && -f $file ]]; then
-    age=$(($(date +%s) - $(stat -c %Y "$file" 2>/dev/null || echo 0)))
-    if ((age < CACHE_TTL)); then
-      cat "$file"
-      return 0
+  if [[ ${FORCE:-0} != 1 ]] && cache_ready; then
+    cached=$(read_private_capped "$file" "$MAX_BYTES") || cached=""
+    if [[ -n $cached ]]; then
+      age=$(($(date +%s) - $(stat -c %Y -- "$file" 2>/dev/null || echo 0)))
+      if ((age >= 0 && age < CACHE_TTL)); then
+        printf '%s' "$cached"
+        return 0
+      fi
     fi
   fi
 
   body=$(api_get "$path")
   if (($? == 0)); then
-    mkdir -p "$CACHE_DIR" && chmod 700 "$CACHE_DIR" 2>/dev/null
-    # Cached bodies carry customer names and amounts. The directory is 700, but
-    # the file is created under a umask of the caller's choosing — so pick one.
-    (umask 077 && printf '%s' "$body" >"$file.tmp") && mv "$file.tmp" "$file"
+    cache_store "$file" "$body"
     printf '%s' "$body"
     return 0
   fi
 
-  if [[ -f $file ]]; then
+  # A forced read skipped the lookup above, so it has nothing in hand yet.
+  if [[ -z $cached ]] && cache_ready; then
+    cached=$(read_private_capped "$file" "$MAX_BYTES") || cached=""
+  fi
+
+  if [[ -n $cached ]]; then
     # Mark it stale so the panel can say so rather than showing old numbers as
     # if they were current.
-    jq -c --arg e "$(echo "$body" | jq -r '.error // "request failed"')" \
-      '. + {stale:true, staleReason:$e}' "$file" 2>/dev/null && return 0
+    jq -c --arg e "$(jq -r '.error // "request failed"' <<<"$body" 2>/dev/null)" \
+      '. + {stale:true, staleReason:$e}' <<<"$cached" 2>/dev/null && return 0
   fi
 
   printf '%s' "$body"
@@ -437,7 +595,7 @@ auth) cmd_auth ;;
 set-key | setkey) do_set_key ;;
 logout) do_logout ;;
 refresh)
-  rm -rf "$CACHE_DIR"
+  cache_drop
   echo "cache dropped"
   ;;
 *) die "unknown command '$cmd' — try status, balance, paid, unpaid, auth, set-key, logout, refresh" ;;

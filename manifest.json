@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.moerdowo.mayar",
   "name": "Mayar",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": "moerdowo",
   "description": "Mayar merchant balance and recent transactions",
   "kinds": [

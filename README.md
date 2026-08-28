@@ -102,6 +102,32 @@ through `--config -`, and `secret-tool store` reads the value the same way.
 Cached responses under `~/.cache/omarchy-mayar` carry customer names and
 amounts, so they are written `0600` inside a `0700` directory.
 
+### Paths that could have been got to first
+
+The key file and every cache entry sit at paths another process on the machine
+could reach before `mayarctl` does, and a symlink or a FIFO left in one of them
+is enough to send the key somewhere, wedge the bar, or redirect a cache write.
+So neither is opened on trust: every directory on the way is checked to be a
+real directory owned by you and writable by nobody else, the entry itself has
+to be a regular file established by `lstat` rather than by a test that follows
+symlinks, and cache writes go through an `mktemp` name in the target directory
+and a rename, never a predictable `$file.tmp`. A cache directory that cannot be
+made private is not used at all — every read then simply misses and the panel
+goes to the network.
+
+### Nothing is read without a ceiling
+
+An API response is refused past 256 KiB, and the ceiling is enforced while it
+is still arriving rather than after: `curl` writes into a `head -c`, so the
+transfer is cut and the connection dropped at the limit even if the server
+never declared a length or intended to stop. Real Mayar payloads are around
+12 KiB. Override with `MAYAR_MAX_BYTES` (bytes, 1 KiB – 8 MiB).
+
+The panel applies the same idea to `mayarctl` itself, which it runs under
+`timeout -s KILL 20 … | head -c 1M`. Quickshell's `StdioCollector` has no size
+limit and `Process` has no deadline of its own, so a helper that ran away or
+hung would otherwise be collected in full, or waited on forever.
+
 ## Sandbox
 
 ```bash

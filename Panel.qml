@@ -252,6 +252,49 @@ Panel {
     }
   }
 
+  // ------------------------------------------------------- running helpers
+
+  // Two things quickshell's Process does not do, and both of them are
+  // unbounded.
+  //
+  // StdioCollector has no ceiling: it appends every byte the child writes until
+  // the stream ends. The row limits further down this file only apply to JSON
+  // that has already been parsed, which is far too late to be what bounds
+  // memory — by then the bytes have been through a shell variable, jq, the
+  // cache and QString. `head -c` in front of the pipe is early enough: it
+  // closes the read end at the ceiling and the helper dies of SIGPIPE.
+  //
+  // `running` has no deadline: a helper wedged on a read that never returns
+  // never emits streamFinished, so `waitForEnd` waits forever and the panel
+  // sits on "Verifying…" with nothing that will ever take it off. `timeout -s
+  // KILL` is a deadline the kernel enforces on the helper itself; the kill
+  // timers below are the one this file enforces on its own state, so the UI
+  // recovers even in the case where the child cannot be reaped at all.
+  //
+  // sh is handed one fixed script and nothing else. The ceiling, the deadline
+  // and the command line all arrive as positional arguments, so no value from
+  // a row, an error string or a key is ever parsed as shell.
+  readonly property int helperTimeout: 20         // seconds, enforced by timeout(1)
+  readonly property int maxHelperBytes: 1048576   // 1 MiB, enforced by head(1)
+
+  function guarded(argv) {
+    return ["/bin/sh", "-c",
+            'cap=$1; secs=$2; shift 2; timeout -s KILL "$secs" "$@" 2>/dev/null | head -c "$cap"',
+            "mayar-guard", String(root.maxHelperBytes), String(root.helperTimeout)]
+           .concat(argv)
+  }
+
+  // Runs a kill timer for exactly as long as its process does, so a deadline is
+  // never left armed against a process that already finished.
+  function armDeadline(timer, proc) {
+    if (proc.running) timer.restart()
+    else timer.stop()
+  }
+
+  // Long enough that the guard's own `timeout` always gets to act first — this
+  // is the backstop for the guard failing, not a second racing deadline.
+  readonly property int deadlineMs: (helperTimeout + 5) * 1000
+
   // -------------------------------------------------------------- actions
 
   function setTab(v) {
@@ -284,9 +327,9 @@ Panel {
   function refresh(force) {
     if (statusProc.running) return
     root.loading = true
-    statusProc.command = force
+    statusProc.command = root.guarded(force
       ? [root.mayarctl, "status", "-n", "8", "-f"]
-      : [root.mayarctl, "status", "-n", "8"]
+      : [root.mayarctl, "status", "-n", "8"])
     statusProc.running = true
   }
 
@@ -386,13 +429,39 @@ Panel {
         root.lastError = root.sanitise(parsed.error)
       }
     }
-    onRunningChanged: if (!running) root.loading = false
+    onRunningChanged: {
+      root.armDeadline(statusKill, statusProc)
+      if (!running) root.loading = false
+    }
   }
 
+  Timer {
+    id: statusKill
+    interval: root.deadlineMs
+    onTriggered: {
+      statusProc.signal(9)
+      statusProc.running = false
+      root.loading = false
+    }
+  }
+
+  // wl-copy forks into the background to serve the selection, so it is the one
+  // helper that is not run under the guard: a pipe to `head` would never see
+  // the end of a stream the daemonised half keeps open. Nothing reads what it
+  // prints either, so it gets no collector — an unread StdioCollector is a
+  // buffer that only ever grows.
   Process {
     id: copyProc
-    stdout: StdioCollector { waitForEnd: true }
-    stderr: StdioCollector { waitForEnd: true }
+    onRunningChanged: root.armDeadline(copyKill, copyProc)
+  }
+
+  Timer {
+    id: copyKill
+    interval: 5000
+    onTriggered: {
+      copyProc.signal(9)
+      copyProc.running = false
+    }
   }
 
   // The key reaches mayarctl on stdin, never as an argument: /proc/<pid>/cmdline
@@ -408,7 +477,7 @@ Panel {
     // answered" from "the helper never ran" and not leave Verifying… on screen.
     property bool gotResult: false
 
-    command: [root.mayarctl, "set-key"]
+    command: root.guarded([root.mayarctl, "set-key"])
     stdinEnabled: true
 
     onStarted: {
@@ -445,7 +514,7 @@ Panel {
       }
     }
 
-    stderr: StdioCollector { waitForEnd: true }
+    onRunningChanged: root.armDeadline(setKeyKill, setKeyProc)
 
     onExited: {
       if (setKeyProc.gotResult) return
@@ -455,12 +524,37 @@ Panel {
     }
   }
 
+  Timer {
+    id: setKeyKill
+    interval: root.deadlineMs
+    onTriggered: {
+      setKeyProc.signal(9)
+      setKeyProc.running = false
+      // The secret is dropped in onStarted, but a helper killed before it ever
+      // started still has a copy of it sitting on this object.
+      setKeyProc.secret = ""
+      if (!setKeyProc.gotResult) {
+        root.savingKey = false
+        root.keyOk = false
+        root.keyMessage = "mayarctl did not answer in time."
+      }
+    }
+  }
+
   Process {
     id: forgetProc
-    command: [root.mayarctl, "logout"]
-    stdout: StdioCollector { waitForEnd: true }
-    stderr: StdioCollector { waitForEnd: true }
+    command: root.guarded([root.mayarctl, "logout"])
+    onRunningChanged: root.armDeadline(forgetKill, forgetProc)
     onExited: root.refresh(true)
+  }
+
+  Timer {
+    id: forgetKill
+    interval: root.deadlineMs
+    onTriggered: {
+      forgetProc.signal(9)
+      forgetProc.running = false
+    }
   }
 
   BarIconButton {
