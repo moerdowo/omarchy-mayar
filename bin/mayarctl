@@ -32,11 +32,22 @@
 # curl. /proc/<pid>/cmdline is world-readable, so an argument is readable by
 # every user on the machine for as long as the process lives; curl gets the
 # Authorization header from a config file on stdin instead.
+#
+# Every path this script reads or writes goes through bin/mayarfs, which does
+# the whole open / read / write / replace / delete lifecycle on descriptors
+# rather than on names. See the header there for why that cannot be done here.
 
 # No `set -e`. The panel polls `status` and renders whatever JSON comes back;
 # a failed API call is a state to report, not a reason to exit and hand the
 # panel an empty stdout.
 set -uo pipefail
+
+# Byte semantics, not the user's locale. Two things below count characters and
+# both of them mean bytes: the ceiling on a response body, and the `read -N`
+# that pulls a length-prefixed payload back from the cache helper. Not exported
+# — this is about how bash measures its own strings, not about how curl and jq
+# talk to the world.
+LC_ALL=C
 
 SERVICE=mayar
 ACCOUNT=api-key
@@ -75,76 +86,44 @@ die() {
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required command '$1'"; }
 need curl
 need jq
+need python3
 
 # ----------------------------------------------------------------- safe paths
 #
 # Every path this script reads or writes is one another process could have got
-# to first. A symlink where the key file is expected sends whatever it points at
-# into an Authorization header; a FIFO there wedges the bar on a read that never
-# returns; a symlink in the cache directory turns a cache write into a write to
-# a file of someone else's choosing. Plain `[[ -r ]]`, `$(<file)`, `cat` and a
-# predictable `$file.tmp` do none of the checking that would notice.
+# to first — and the part a 0700 directory does not cover is that the other
+# process can be running as this same user, in which case the mode bits have
+# nothing to say. A symlink where the key file is expected sends whatever it
+# points at into an Authorization header; a FIFO there wedges the bar on a read
+# that never returns; a symlink in the cache directory turns a cache write into
+# a write to a file of someone else's choosing.
 #
-# Two rules close all three, and they only work as a pair:
+# Checking a path and then opening it does not stop any of that, however careful
+# the check is. They are two operations against a *name*, and between them the
+# name can be made to mean something else — the entry replaced, or any directory
+# on the way to it. The check then describes something that is no longer what
+# gets opened.
 #
-#   1. every directory on the way to a path must be a real directory owned by
-#      this user or root and writable by nobody else. That is what makes rule 2
-#      safe to trust rather than a race: in a directory no one else can write,
-#      no one else can swap the entry between the test and the open.
-#
-#   2. the entry itself must be a regular file owned by this user, established
-#      with lstat — `find -type f` does not follow symlinks — rather than with
-#      `[[ -f ]]`, which follows one and answers about the target.
-#
-# Bash has no redirection that opens O_NOFOLLOW|O_NONBLOCK, so rule 2 is what
-# stands in for those flags: a symlink or a FIFO matches nothing, and the open
-# that could have followed or blocked is never reached.
+# Bash cannot close that gap. It has no redirection that opens O_NOFOLLOW or
+# O_NONBLOCK, and no openat, renameat or unlinkat — every builtin it has, and
+# every coreutil it can call, starts again from the name. So the filesystem
+# lives in bin/mayarfs instead: it walks a path once, a component at a time,
+# each step an openat on the descriptor of the component before it and each
+# descriptor validated by fstat, and then performs the entire lifecycle
+# relative to that descriptor. A name is never resolved twice. Read the header
+# in bin/mayarfs for the detail.
 
-me_uid=$(id -u)
+HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) || HERE=.
+MAYARFS="$HERE/mayarfs"
+[[ -f $MAYARFS ]] || die "missing helper '$MAYARFS' — the plugin is incomplete"
 
-# Walks the resolved path upwards. Resolving first matters: the components
-# tested here are then the ones the kernel will actually traverse, where testing
-# the unresolved spelling would test names a symlink component makes irrelevant.
-dir_is_private() {
-  local d uid mode
-  d=$(realpath -m -- "$1" 2>/dev/null) || return 1
-  while :; do
-    [[ -d $d && ! -L $d ]] || return 1
-    read -r uid mode < <(stat -c '%u %a' -- "$d" 2>/dev/null) || return 1
-    [[ $uid == "$me_uid" || $uid == 0 ]] || return 1
-    ((8#$mode & 8#22)) && return 1
-    [[ $d == / ]] && return 0
-    d=${d%/*}
-    [[ -n $d ]] || d=/
-  done
-}
-
-# True when $1 names a regular file that only this user could have put there.
-is_private_file() {
-  local path=$1 dir=${1%/*} base=${1##*/} extra=${2:-}
-  [[ $dir == "$path" ]] && dir=.
-  dir_is_private "$dir" || return 1
-  [[ -n $(find "$dir" -maxdepth 1 -mindepth 1 -name "$base" \
-    -type f -uid "$me_uid" $extra -print -quit 2>/dev/null) ]]
-}
-
-# The key. Read in-shell so the secret never crosses a process boundary it does
-# not have to, and capped with `read -N` so a file of surprising size cannot
-# pull more than 4 KiB in. A group- or world-writable key file is refused
-# outright: anyone who can rewrite it can choose which server the key goes to.
+# The key file. Capped at 4 KiB so a file of surprising size cannot pull more
+# than that in, and refused outright if it is group- or world-writable: anyone
+# who can rewrite it chooses which server the key goes to. The secret crosses
+# one pipe, from a process this script started — never an argument, never the
+# environment, never a temporary file.
 read_private_key() {
-  local path=$1 content=""
-  is_private_file "$path" '! -perm /022' || return 1
-  IFS= read -r -N 4096 content <"$path" 2>/dev/null
-  printf '%s' "$content"
-}
-
-# Cached JSON. Larger, so `head -c` does the reading and the capping in one go
-# rather than bash pulling it in a character at a time.
-read_private_capped() {
-  local path=$1 max=$2
-  is_private_file "$path" || return 1
-  head -c "$max" -- "$path" 2>/dev/null
+  python3 -- "$MAYARFS" read-key "$1" 4096 2>/dev/null
 }
 
 # ---------------------------------------------------------------- credentials
@@ -155,8 +134,20 @@ read_private_capped() {
 # where no keyring daemon is running.
 key_source=""
 
+# The answer comes back in API_KEY rather than on stdout. A caller writing
+# `k=$(api_key)` would fork a subshell and pipe the secret through it for no
+# reason, and would also throw away everything else the call worked out — which
+# source it came from, and the file read below.
+API_KEY=""
+
+# Reading the file starts a helper, and `status` asks for the key once per
+# endpoint. Ask the filesystem once per run.
+key_file_read=0
+key_file_value=""
+
 api_key() {
   local k
+  API_KEY=""
 
   # Whitespace is stripped from every source, not just the file: a key pasted
   # with a trailing newline is the same key, and a stray newline would break
@@ -165,7 +156,7 @@ api_key() {
     k=${MAYAR_API_KEY//[[:space:]]/}
     if [[ -n $k ]]; then
       key_source=env
-      printf '%s' "$k"
+      API_KEY=$k
       return 0
     fi
   fi
@@ -175,18 +166,20 @@ api_key() {
     k=${k//[[:space:]]/}
     if [[ -n $k ]]; then
       key_source=keyring
-      printf '%s' "$k"
+      API_KEY=$k
       return 0
     fi
   fi
 
-  if k=$(read_private_key "$CONFIG_FILE"); then
-    k=${k//[[:space:]]/}
-    if [[ -n $k ]]; then
-      key_source=file
-      printf '%s' "$k"
-      return 0
-    fi
+  if ((!key_file_read)); then
+    key_file_value=$(read_private_key "$CONFIG_FILE") || key_file_value=""
+    key_file_read=1
+  fi
+  k=${key_file_value//[[:space:]]/}
+  if [[ -n $k ]]; then
+    key_source=file
+    API_KEY=$k
+    return 0
   fi
 
   key_source=none
@@ -258,6 +251,8 @@ do_logout() {
   else
     echo "No key was stored in the keyring; dropped the cache."
   fi
+  # Advisory only: this decides whether to print a sentence, and nothing is
+  # opened, read or removed on the strength of it.
   [[ -e $CONFIG_FILE || -L $CONFIG_FILE ]] &&
     echo "Note: $CONFIG_FILE still exists and will still be used. Delete it too if you meant to."
   [[ -n ${MAYAR_API_KEY:-} ]] &&
@@ -271,10 +266,11 @@ do_logout() {
 # non-zero, so callers can distinguish the two without parsing prose.
 api_get() {
   local path=$1 key body http sep esc
-  key=$(api_key) || {
+  api_key || {
     echo '{"error":"no API key"}'
     return 1
   }
+  key=$API_KEY
 
   # The key reaches curl through a config file on stdin, never through argv.
   # /proc/<pid>/cmdline is world-readable, so `-H "Authorization: Bearer ..."`
@@ -316,8 +312,9 @@ api_get() {
       "${API_BASE}${path}" 2>&1 |
     head -c "$((MAX_BYTES + 1))")
 
-  # Bytes, not characters: ${#body} would measure a multibyte body short.
-  if (($(printf '%s' "$body" | wc -c) > MAX_BYTES)); then
+  # Bytes, not characters — which is what LC_ALL=C above buys: outside it,
+  # ${#body} counts characters and would measure a multibyte body short.
+  if ((${#body} > MAX_BYTES)); then
     jq -nc --argjson n "$MAX_BYTES" \
       '{error:("response was larger than " + ($n | tostring) + " bytes — refused")}'
     return 1
@@ -352,91 +349,153 @@ api_get() {
   printf '%s' "$body"
 }
 
-# Cached bodies carry customer names and amounts, so the cache gets a directory
-# nothing else can write to — and the directory is verified after it is created,
-# not merely created: `mkdir -p` is perfectly happy to accept a directory, or a
-# symlink to one, that somebody else put there first. A cache that cannot be
-# made private is not used at all; every read below then simply misses and the
-# panel goes to the network, which is slower and still correct.
+# Cached bodies carry customer names and amounts, so the cache lives in a
+# directory nothing else can write to — and the directory is not merely created
+# but opened and validated, because `mkdir -p` is perfectly happy to accept a
+# directory, or a symlink to one, that somebody else put there first.
+#
+# bin/mayarfs is started once and kept alive as a coprocess for the length of
+# this run. It opens the cache directory once, on a descriptor it validated, and
+# every entry after that is read, written, replaced and removed relative to that
+# one descriptor. The directory is never named again, so there is no second
+# resolution for anyone to redirect: a swap between two cache operations reaches
+# a name nothing is looking at any more.
+#
+# A cache that cannot be made private is not used at all. Every read then simply
+# misses and the panel goes to the network, which is slower and still correct.
 cache_ok=""
+cache_r=""
+cache_w=""
 
 cache_ready() {
   [[ -n $cache_ok ]] && return "$cache_ok"
   cache_ok=1
-  mkdir -p -m 700 -- "$CACHE_DIR" 2>/dev/null
-  if [[ -d $CACHE_DIR && ! -L $CACHE_DIR ]] && chmod 700 -- "$CACHE_DIR" 2>/dev/null &&
-    dir_is_private "$CACHE_DIR"; then
-    cache_ok=0
-    # A helper killed mid-write — by its own deadline, or by the panel's —
-    # leaves its mktemp file behind. Sweep the stragglers rather than letting
-    # them accumulate for the life of the install.
-    find "$CACHE_DIR" -maxdepth 1 -type f -name '*.json.??????????' \
-      -mmin +60 -delete 2>/dev/null
+
+  local hello
+  coproc CACHEFS { exec python3 -- "$MAYARFS" cache "$CACHE_DIR" 2>/dev/null; }
+  cache_r=${CACHEFS[0]}
+  cache_w=${CACHEFS[1]}
+
+  # The helper says READY only once the directory is open, private and swept.
+  # Anything else — a refusal, a crash, silence — leaves the cache off.
+  IFS= read -r -t 10 -u "$cache_r" hello 2>/dev/null || hello=""
+  if [[ $hello != READY ]]; then
+    cache_stop
+    return 1
   fi
-  return "$cache_ok"
+  cache_ok=0
+  return 0
 }
 
-# `rm` never follows the argument itself, so a symlink left in place of the
-# cache directory loses the link rather than what it points at.
-cache_drop() {
-  rm -rf -- "$CACHE_DIR"
-  cache_ok=""
+cache_stop() {
+  [[ -n $cache_r ]] && exec {cache_r}<&-
+  [[ -n $cache_w ]] && exec {cache_w}>&-
+  cache_r=""
+  cache_w=""
+  [[ -n ${CACHEFS_PID:-} ]] && wait "$CACHEFS_PID" 2>/dev/null
+  return 0
 }
 
-# mktemp names the temporary file, in the same directory as its target, so there
-# is no predictable `$file.tmp` for a preplaced symlink to aim at — and it
-# creates it 0600 rather than at the caller's umask. `mv` then renames over the
-# target, which replaces a symlink sitting there instead of writing through it.
-cache_store() {
-  local file=$1 data=$2 tmp
-  cache_ready || return 1
-  tmp=$(mktemp -- "$file.XXXXXXXXXX" 2>/dev/null) || return 1
-  if printf '%s' "$data" >"$tmp" && mv -f -- "$tmp" "$file"; then
-    return 0
-  fi
-  rm -f -- "$tmp"
+# After a protocol failure the stream is no longer at a known boundary, so
+# nothing further can be read off it and meant: the cache is done for this run.
+cache_fail() {
+  cache_stop
+  cache_ok=1
   return 1
+}
+
+# Set by cache_read. The age is not a separate stat of the path afterwards — it
+# comes from the same fstat, on the same descriptor, that established the bytes
+# were a regular file of ours before they were read.
+CACHED=""
+CACHED_AGE=-1
+
+# Every exchange with the helper is bounded by -t: the panel is waiting on this,
+# and a helper that stopped answering must not become a bar that stopped
+# updating.
+cache_read() {
+  local name=$1 max=$2 status age len
+  CACHED=""
+  CACHED_AGE=-1
+  cache_ready || return 1
+  printf 'READ %s %s\n' "$name" "$max" >&"$cache_w" 2>/dev/null || { cache_fail; return 1; }
+  IFS=' ' read -r -t 10 -u "$cache_r" status age len 2>/dev/null || { cache_fail; return 1; }
+  [[ $status == OK ]] || return 1
+  ((len > 0)) || return 1
+  # -N takes exactly that many bytes and stops, newlines and all — a cached
+  # body is JSON and may well contain them.
+  IFS= read -r -N "$len" -t 10 -u "$cache_r" CACHED 2>/dev/null || { cache_fail; return 1; }
+  CACHED_AGE=$age
+  return 0
+}
+
+cache_write() {
+  local name=$1 data=$2 status
+  cache_ready || return 1
+  printf 'WRITE %s %s\n%s' "$name" "${#data}" "$data" >&"$cache_w" 2>/dev/null ||
+    { cache_fail; return 1; }
+  IFS= read -r -t 10 -u "$cache_r" status 2>/dev/null || { cache_fail; return 1; }
+  [[ $status == OK ]]
+}
+
+# The helper empties and removes the directory through the descriptors it has
+# held all along, then exits — so this shuts the coprocess down rather than
+# leaving it holding a descriptor to a directory that is gone.
+cache_drop() {
+  local reply
+  if cache_ready; then
+    printf 'DROP\n' >&"$cache_w" 2>/dev/null
+    IFS= read -r -t 10 -u "$cache_r" reply 2>/dev/null
+  fi
+  cache_stop
+  cache_ok=""
+  return 0
 }
 
 # api_get through a TTL cache, keyed by path. A stale entry is preferred over
 # an error: if the request fails and something cached exists, the panel keeps
 # showing the last known numbers instead of blanking out.
-cached_get() {
-  local path=$1 slug file age body cached=""
-  slug=$(printf '%s' "${MAYAR_ENV:-production}$path" | tr -c 'a-zA-Z0-9' '_')
-  file="$CACHE_DIR/$slug.json"
+#
+# The answer lands in RESP rather than on stdout. `$(cached_get …)` would run
+# all of this in a subshell, and the coprocess — the whole point of which is one
+# validated descriptor for the run — would then be started, used once and thrown
+# away for each endpoint in turn.
+RESP=""
 
-  if [[ ${FORCE:-0} != 1 ]] && cache_ready; then
-    cached=$(read_private_capped "$file" "$MAX_BYTES") || cached=""
-    if [[ -n $cached ]]; then
-      age=$(($(date +%s) - $(stat -c %Y -- "$file" 2>/dev/null || echo 0)))
-      if ((age >= 0 && age < CACHE_TTL)); then
-        printf '%s' "$cached"
-        return 0
-      fi
+cached_get() {
+  local path=$1 name cached="" merged
+  name=$(printf '%s' "${MAYAR_ENV:-production}$path" | tr -c 'a-zA-Z0-9' '_').json
+
+  if [[ ${FORCE:-0} != 1 ]] && cache_read "$name" "$MAX_BYTES"; then
+    cached=$CACHED
+    if ((CACHED_AGE >= 0 && CACHED_AGE < CACHE_TTL)); then
+      RESP=$cached
+      return 0
     fi
   fi
 
-  body=$(api_get "$path")
+  RESP=$(api_get "$path")
   if (($? == 0)); then
-    cache_store "$file" "$body"
-    printf '%s' "$body"
+    cache_write "$name" "$RESP"
     return 0
   fi
 
   # A forced read skipped the lookup above, so it has nothing in hand yet.
-  if [[ -z $cached ]] && cache_ready; then
-    cached=$(read_private_capped "$file" "$MAX_BYTES") || cached=""
+  if [[ -z $cached ]] && cache_read "$name" "$MAX_BYTES"; then
+    cached=$CACHED
   fi
 
   if [[ -n $cached ]]; then
     # Mark it stale so the panel can say so rather than showing old numbers as
     # if they were current.
-    jq -c --arg e "$(jq -r '.error // "request failed"' <<<"$body" 2>/dev/null)" \
-      '. + {stale:true, staleReason:$e}' <<<"$cached" 2>/dev/null && return 0
+    merged=$(jq -c --arg e "$(jq -r '.error // "request failed"' <<<"$RESP" 2>/dev/null)" \
+      '. + {stale:true, staleReason:$e}' <<<"$cached" 2>/dev/null)
+    if [[ -n $merged ]]; then
+      RESP=$merged
+      return 0
+    fi
   fi
 
-  printf '%s' "$body"
   return 1
 }
 
@@ -489,23 +548,36 @@ limit_arg() {
   echo "$n"
 }
 
-cmd_balance() { cached_get "/balances"; }
+# cached_get answers in RESP, so these print it and pass its status on.
+cmd_balance() {
+  local rc
+  cached_get "/balances"
+  rc=$?
+  printf '%s' "$RESP"
+  return "$rc"
+}
 
 cmd_paid() {
-  local n
+  local n rc
   n=$(limit_arg "${1:-10}")
   cached_get "/transactions?limit=${n}"
+  rc=$?
+  printf '%s' "$RESP"
+  return "$rc"
 }
 
 cmd_unpaid() {
-  local n
+  local n rc
   n=$(limit_arg "${1:-10}")
   cached_get "/transactions/unpaid?limit=${n}"
+  rc=$?
+  printf '%s' "$RESP"
+  return "$rc"
 }
 
 cmd_auth() {
   local ok=false
-  api_key >/dev/null && ok=true
+  api_key && ok=true
   jq -nc \
     --argjson authenticated "$ok" \
     --arg source "$key_source" \
@@ -522,7 +594,7 @@ cmd_status() {
   local n bal paid unpaid
   n=$(limit_arg "${1:-10}")
 
-  if ! api_key >/dev/null; then
+  if ! api_key; then
     jq -nc \
       --arg env "${MAYAR_ENV:-production}" \
       --argjson keyring "$(command -v secret-tool >/dev/null 2>&1 && echo true || echo false)" \
@@ -531,9 +603,14 @@ cmd_status() {
     return 0
   fi
 
-  bal=$(cmd_balance)
-  paid=$(cmd_paid "$n")
-  unpaid=$(cmd_unpaid "$n")
+  # Called in line rather than through $(…): the three of them share one cache
+  # coprocess, and a subshell each would mean a descriptor each.
+  cached_get "/balances"
+  bal=$RESP
+  cached_get "/transactions?limit=${n}"
+  paid=$RESP
+  cached_get "/transactions/unpaid?limit=${n}"
+  unpaid=$RESP
 
   # First real error wins for the headline; the panel shows one line, not three.
   local err

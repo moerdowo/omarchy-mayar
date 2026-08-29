@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+"""mayarfs — the filesystem half of mayarctl, done on descriptors.
+
+Everything mayarctl reads or writes sits at a path another process running as
+the same user could get to first: the API key file, and every cache entry
+holding customer names and amounts. Checking such a path and then opening it is
+two operations, and the gap between them is the whole attack — the entry, or
+any directory on the way to it, can be replaced after the check and before the
+open, so what gets opened is never provably what was approved. Mode 0700 does
+not help: it keeps *other* accounts out, and the process doing the swapping is
+this account.
+
+Nothing here re-resolves a pathname. A path is walked once, one component at a
+time, each step an `openat` on the descriptor of the component before it, and
+each resulting descriptor validated by `fstat` — so a component swapped after
+its check is a descriptor that still points at what was checked. What that walk
+produces is a directory descriptor, and every subsequent read, write, rename,
+stat and unlink happens relative to it. In `cache` mode that descriptor is held
+open for the whole of mayarctl's run, so the cache is opened, read, replaced and
+removed through one descriptor that was validated once and cannot be swapped.
+
+Files are opened `O_NOFOLLOW | O_NONBLOCK` and validated on the descriptor that
+open returned:
+
+  O_NOFOLLOW  a symlink left in place of the entry fails the open outright,
+              rather than sending the key to whatever it points at.
+  O_NONBLOCK  a FIFO left there returns immediately instead of hanging the bar
+              on a read that never completes.
+  fstat       the descriptor itself has to be a regular file owned by this
+              user, which is what rejects the FIFO, the device node and the
+              directory that O_NOFOLLOW alone lets through.
+
+Two entry points:
+
+  mayarfs read-key <path> <max>   print at most <max> bytes of a private file.
+  mayarfs cache <dir>             hold <dir> open and serve cache operations
+                                  on stdin (see serve() for the protocol).
+"""
+
+import errno
+import os
+import re
+import stat
+import sys
+import time
+from collections import deque
+
+ME = os.getuid()
+
+# Enough hops to resolve the symlinks a real $HOME or XDG override goes
+# through, few enough that a loop somebody planted terminates.
+SYMLINK_BUDGET = 40
+
+# Cache entries, and the temporary files a write passes through. Names come
+# from mayarctl's slug of an API path, and are checked here as well: a name is
+# used as an `openat` argument, so it has to be a single component with no
+# slashes and nothing that could climb out of the directory.
+ENTRY_RE = re.compile(r"\A[A-Za-z0-9_]+\.json\Z")
+TEMP_RE = re.compile(r"\A[A-Za-z0-9_]+\.json\.[0-9a-f]{10}\Z")
+
+# A helper killed mid-write — by its own deadline, or by the panel's — leaves
+# its temporary file behind. Sweep the stragglers rather than letting them
+# accumulate for the life of the install.
+TEMP_MAX_AGE = 3600
+
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+
+
+class Refused(Exception):
+    """A path that will not be used. The message says which part of it."""
+
+
+# ------------------------------------------------------------------ the walk
+
+def dir_ok(fd):
+    """A directory this user could have made and nobody else can write to.
+
+    Asked of a descriptor, not a name — this is what makes the answer keep
+    holding after it is given. root-owned components are allowed because /,
+    /home and the like are not this user's to own.
+    """
+    st = os.fstat(fd)
+    return (stat.S_ISDIR(st.st_mode)
+            and st.st_uid in (ME, 0)
+            and not st.st_mode & 0o022)
+
+
+def entries(dir_fd):
+    """List an open directory, rewound first.
+
+    os.listdir() on a descriptor dups it, and a dup shares the file offset —
+    so a second listing of a descriptor that has already been read to the end
+    comes back empty, whatever has been created in the meantime. The cache
+    directory is listed twice in a run (swept at startup, emptied by DROP) and
+    changes in between, so the rewind is not optional.
+    """
+    os.lseek(dir_fd, 0, os.SEEK_SET)
+    return os.listdir(dir_fd)
+
+
+def is_symlink(name, dir_fd):
+    """lstat through the descriptor we are standing in, never a pathname."""
+    try:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISLNK(st.st_mode)
+
+
+def open_dir(name, parent_fd, create=False):
+    """openat a single component, validate the descriptor, return it."""
+    try:
+        fd = os.open(name, DIR_FLAGS, dir_fd=parent_fd)
+    except OSError as e:
+        if e.errno == errno.ENOENT and create:
+            # 0700 from the start rather than a chmod afterwards: a directory
+            # is never briefly wider than it is meant to end up.
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            fd = os.open(name, DIR_FLAGS, dir_fd=parent_fd)
+        else:
+            raise
+    if not dir_ok(fd):
+        os.close(fd)
+        raise Refused("%r is not a directory only you can write to" % name)
+    return fd
+
+
+def walk(path, create=False):
+    """Open every directory in `path`, each on the descriptor before it.
+
+    Returns the stack of descriptors, root first, for the caller to close. A
+    symlink component is resolved by hand — `readlinkat` on the directory we
+    are standing in, then its target pushed back onto the queue — so the
+    kernel never resolves more than the one component we are looking at, and
+    every component it does resolve is one we then validate.
+    """
+    stack = [os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)]
+    todo = deque(path.split("/"))
+    budget = SYMLINK_BUDGET
+    try:
+        if not dir_ok(stack[0]):
+            raise Refused("/ is not a directory only root can write to")
+        while todo:
+            comp = todo.popleft()
+            if comp in ("", "."):
+                continue
+            if comp == "..":
+                # Walk back up the descriptors already held rather than asking
+                # the kernel for "..", which would resolve against the name.
+                if len(stack) > 1:
+                    os.close(stack.pop())
+                continue
+            try:
+                stack.append(open_dir(comp, stack[-1], create))
+            except OSError as e:
+                # O_NOFOLLOW refuses a symlink with ELOOP, or with ENOTDIR when
+                # O_DIRECTORY is also set — which it always is here. Neither
+                # errno is proof on its own, so ask the descriptor what the
+                # component actually is before treating it as a link.
+                if e.errno not in (errno.ELOOP, errno.ENOTDIR) or \
+                        not is_symlink(comp, stack[-1]):
+                    raise
+                budget -= 1
+                if budget < 0:
+                    raise Refused("too many symlinks in %r" % path)
+                target = os.readlink(comp, dir_fd=stack[-1])
+                if target.startswith("/"):
+                    while len(stack) > 1:
+                        os.close(stack.pop())
+                todo.extendleft(reversed(target.split("/")))
+    except BaseException:
+        for fd in stack:
+            os.close(fd)
+        raise
+    return stack
+
+
+def split_leaf(path):
+    """An absolute path as (parent, last component).
+
+    The last component is kept apart from the walk on purpose: it is the one
+    thing that is never followed. A symlink where the cache directory belongs
+    is refused rather than obeyed, and `logout` deletes that symlink rather
+    than what it aims at.
+    """
+    path = os.path.abspath(path).rstrip("/")
+    if not path:
+        raise Refused("/ is not a usable path here")
+    parent, _, leaf = path.rpartition("/")
+    return parent or "/", leaf
+
+
+# ------------------------------------------------------------- reading a file
+
+def open_regular(dir_fd, name):
+    """openat a leaf that must not be followed, with the refusal spelled out."""
+    try:
+        return os.open(name, FILE_FLAGS, dir_fd=dir_fd)
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.ENOTDIR) and is_symlink(name, dir_fd):
+            raise Refused("%r is a symlink" % name)
+        raise
+
+
+def read_entry(dir_fd, name, cap):
+    """Read at most `cap` bytes of a regular file, as (age, bytes).
+
+    One open, then everything else asked of that descriptor: whether it is a
+    regular file, who owns it, how old it is, what is in it. The name is not
+    consulted again, so there is no second chance to swap what it points at —
+    and `age` comes from the same `fstat` as the ownership check rather than a
+    separate `stat` of the pathname later on.
+    """
+    fd = open_regular(dir_fd, name)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Refused("%r is not a regular file" % name)
+        if st.st_uid != ME:
+            raise Refused("%r is not owned by you" % name)
+        chunks = []
+        got = 0
+        while got < cap:
+            chunk = os.read(fd, min(1 << 16, cap - got))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            got += len(chunk)
+        return int(time.time() - st.st_mtime), b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def read_key(path, cap):
+    """The API key file: the same read, plus a refusal to use a writable one.
+
+    Anyone who can rewrite the key file chooses which server the key goes to,
+    so a group- or world-writable one is not read at all.
+    """
+    parent, leaf = split_leaf(path)
+    stack = walk(parent)
+    try:
+        fd = open_regular(stack[-1], leaf)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != ME:
+                raise Refused("%r is not a regular file of yours" % path)
+            if st.st_mode & 0o022:
+                raise Refused("%r is writable by others" % path)
+            return os.read(fd, cap)
+        finally:
+            os.close(fd)
+    finally:
+        for fd in stack:
+            os.close(fd)
+
+
+# ------------------------------------------------------------------ the cache
+
+class Cache:
+    """The cache directory, held open for as long as mayarctl runs.
+
+    Opened and validated once in `open_once`; from then on every entry is read,
+    written, renamed and removed relative to `self.fd`. Nothing below ever
+    names the directory again, so nothing below can be pointed somewhere else
+    by replacing it.
+    """
+
+    def __init__(self, path):
+        self.parent_path, self.name = split_leaf(path)
+        self.stack = []
+        self.fd = -1
+
+    def open_once(self):
+        self.stack = walk(self.parent_path, create=True)
+        self.fd = open_dir(self.name, self.stack[-1], create=True)
+        # An existing directory may predate this rule, or have been made by
+        # something with a looser umask. dir_ok() already refused anything
+        # group- or world-writable; this narrows the rest to 0700, on the
+        # descriptor rather than the name.
+        os.fchmod(self.fd, 0o700)
+        self.sweep()
+
+    def close(self):
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+        for fd in self.stack:
+            os.close(fd)
+        self.stack = []
+
+    def sweep(self):
+        now = time.time()
+        for name in entries(self.fd):
+            if not TEMP_RE.match(name):
+                continue
+            try:
+                st = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+                if now - st.st_mtime > TEMP_MAX_AGE:
+                    os.unlink(name, dir_fd=self.fd)
+            except OSError:
+                pass
+
+    def read(self, name, cap):
+        return read_entry(self.fd, name, cap)
+
+    def write(self, name, data):
+        """Create, fill and rename an entry without leaving the descriptor.
+
+        The temporary name is random, so there is no predictable `$file.tmp`
+        for a symlink to be waiting at, and O_EXCL | O_NOFOLLOW means the
+        create fails outright rather than writing through anything already
+        there. `renameat` within the same descriptor then replaces the entry —
+        it never follows a symlink sitting at the target, and it is atomic, so
+        a reader sees the old entry or the new one and never a half-written
+        file.
+        """
+        tmp = "%s.%s" % (name, os.urandom(5).hex())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                     | os.O_CLOEXEC, 0o600, dir_fd=self.fd)
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+        except BaseException:
+            os.close(fd)
+            try:
+                os.unlink(tmp, dir_fd=self.fd)
+            except OSError:
+                pass
+            raise
+        os.close(fd)
+        try:
+            os.rename(tmp, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=self.fd)
+            except OSError:
+                pass
+            raise
+
+    def drop(self):
+        """Empty the directory and remove it, all of it descriptor-relative.
+
+        The directory goes through `rmdir` on the *parent's* descriptor and by
+        the name the walk validated, so this cannot climb out to somewhere
+        else, and a symlink left where the directory was is unlinked rather
+        than followed.
+        """
+        purge(self.fd)
+        mine = os.fstat(self.fd)
+        os.close(self.fd)
+        self.fd = -1
+        parent = self.stack[-1]
+        try:
+            st = os.stat(self.name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(st.st_mode):
+            # A symlink (or anything else) is sitting at the name now. Unlink
+            # it — that removes the link, never what it points at.
+            os.unlink(self.name, dir_fd=parent)
+        elif (st.st_dev, st.st_ino) == (mine.st_dev, mine.st_ino):
+            os.rmdir(self.name, dir_fd=parent)
+        # Otherwise the name has come to mean a different directory since the
+        # descriptor above was opened. The one this run was using is empty, and
+        # somebody else's is not ours to remove.
+
+
+def purge(dir_fd, depth=8):
+    """Unlink everything under an open directory, depth first.
+
+    The cache holds nothing but files, but `refresh` and `logout` should not
+    be defeatable by dropping a non-empty directory in there, so subdirectories
+    are descended — by descriptor, never following a symlink.
+    """
+    for name in entries(dir_fd):
+        try:
+            st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(st.st_mode):
+                os.unlink(name, dir_fd=dir_fd)
+                continue
+            if depth > 0:
+                child = os.open(name, DIR_FLAGS, dir_fd=dir_fd)
+                try:
+                    purge(child, depth - 1)
+                finally:
+                    os.close(child)
+            os.rmdir(name, dir_fd=dir_fd)
+        except OSError:
+            pass
+
+
+# ----------------------------------------------------------------- the server
+
+def serve(path):
+    """Hold the cache open and answer mayarctl on stdin until it goes away.
+
+    A request per line; payloads are length-prefixed, because a cached body is
+    JSON that may well contain newlines. Lengths are bytes on both sides —
+    mayarctl runs under LC_ALL=C so its `read -N` counts the same units.
+
+        READ <entry> <max>          -> OK <age-seconds> <len>\\n<len bytes>
+                                     | MISS
+                                     | ERR <reason>
+        WRITE <entry> <len>\\n<bytes> -> OK | ERR <reason>
+        DROP                        -> OK | ERR <reason>, then exit
+
+    A single run of mayarctl reads three endpoints and may write all three
+    back; serving them from one process is what keeps all of it on the one
+    descriptor opened below.
+    """
+    out = sys.stdout.buffer
+    inp = sys.stdin.buffer
+
+    cache = Cache(path)
+    try:
+        cache.open_once()
+    except (OSError, Refused) as e:
+        # mayarctl treats this as "no cache": every read misses, the panel goes
+        # to the network, which is slower and still correct.
+        out.write(b"ERR %s\n" % str(e).encode("utf-8", "replace"))
+        out.flush()
+        return 1
+
+    def reply(text):
+        out.write(text.encode("utf-8", "replace") + b"\n")
+        out.flush()
+
+    reply("READY")
+
+    try:
+        for line in iter(inp.readline, b""):
+            parts = line.rstrip(b"\n").decode("utf-8", "replace").split(" ")
+            cmd = parts[0]
+
+            if cmd == "DROP":
+                try:
+                    cache.drop()
+                    reply("OK")
+                except (OSError, Refused) as e:
+                    reply("ERR %s" % e)
+                return 0
+
+            if cmd == "READ" and len(parts) == 3 and ENTRY_RE.match(parts[1]):
+                try:
+                    age, data = cache.read(parts[1], int(parts[2]))
+                except (FileNotFoundError, Refused):
+                    reply("MISS")
+                    continue
+                except (OSError, ValueError) as e:
+                    reply("ERR %s" % e)
+                    continue
+                reply("OK %d %d" % (age, len(data)))
+                out.write(data)
+                out.flush()
+                continue
+
+            if cmd == "WRITE" and len(parts) == 3 and ENTRY_RE.match(parts[1]):
+                try:
+                    size = int(parts[2])
+                except ValueError:
+                    reply("ERR bad length")
+                    continue
+                data = inp.read(size)
+                if len(data) != size:
+                    return 1
+                try:
+                    cache.write(parts[1], data)
+                    reply("OK")
+                except (OSError, Refused) as e:
+                    reply("ERR %s" % e)
+                continue
+
+            reply("ERR bad request")
+    finally:
+        cache.close()
+    return 0
+
+
+def main(argv):
+    if len(argv) == 4 and argv[1] == "read-key":
+        try:
+            sys.stdout.buffer.write(read_key(argv[2], int(argv[3])))
+            sys.stdout.buffer.flush()
+        except (OSError, Refused, ValueError) as e:
+            sys.stderr.write("mayarfs: %s\n" % e)
+            return 1
+        return 0
+
+    if len(argv) == 3 and argv[1] == "cache":
+        return serve(argv[2])
+
+    sys.stderr.write("usage: mayarfs read-key <path> <max> | mayarfs cache <dir>\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

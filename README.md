@@ -97,23 +97,42 @@ The key is never passed as a command-line argument — not to `mayarctl`, not to
 argument is readable by every other user on the machine for as long as the
 process lives. It travels on stdin in all three directions: the panel writes it
 to `mayarctl set-key`, `mayarctl` hands `curl` the `Authorization` header
-through `--config -`, and `secret-tool store` reads the value the same way.
+through `--config -`, and `secret-tool store` reads the value the same way. It
+is never written to a temporary file and never put in the environment of
+anything `mayarctl` runs.
 
 Cached responses under `~/.cache/omarchy-mayar` carry customer names and
 amounts, so they are written `0600` inside a `0700` directory.
 
 ### Paths that could have been got to first
 
-The key file and every cache entry sit at paths another process on the machine
-could reach before `mayarctl` does, and a symlink or a FIFO left in one of them
-is enough to send the key somewhere, wedge the bar, or redirect a cache write.
-So neither is opened on trust: every directory on the way is checked to be a
-real directory owned by you and writable by nobody else, the entry itself has
-to be a regular file established by `lstat` rather than by a test that follows
-symlinks, and cache writes go through an `mktemp` name in the target directory
-and a rename, never a predictable `$file.tmp`. A cache directory that cannot be
-made private is not used at all — every read then simply misses and the panel
-goes to the network.
+The key file and every cache entry sit at paths another process could reach
+before `mayarctl` does — including a process running as **you**, which is the
+case a `0700` directory says nothing about. A symlink or a FIFO left in one of
+those paths is enough to send the key somewhere, wedge the bar, or redirect a
+cache write.
+
+Checking a path and then opening it does not stop that, however careful the
+check. They are two operations against a *name*, and in between the name can be
+made to mean something else — the entry replaced, or any directory on the way to
+it — so what gets opened is never provably what was approved. Bash cannot close
+that gap: it has no `O_NOFOLLOW`, no `O_NONBLOCK`, and no `openat`, `renameat`
+or `unlinkat`.
+
+So the filesystem lives in `bin/mayarfs`, and nothing there resolves a name
+twice. A path is walked once, a component at a time, each step an `openat` on
+the descriptor of the component before it and each descriptor checked with
+`fstat` — a component swapped after its check is a descriptor that still points
+at what was checked. Files are opened `O_NOFOLLOW | O_NONBLOCK` and then
+validated on the descriptor the open returned, so a symlink fails outright, a
+FIFO returns instead of hanging the bar, and a file's age comes from the same
+`fstat` as its ownership rather than a later look at the name. The cache
+directory is opened once and held for the run: every entry after that is read,
+written, replaced with `renameat` and removed with `unlinkat` relative to that
+one descriptor, and the directory is never named again.
+
+A cache directory that cannot be made private is not used at all — every read
+then simply misses and the panel goes to the network.
 
 ### Nothing is read without a ceiling
 
@@ -181,8 +200,9 @@ mayarctl refresh         # drop the response cache
 
 Add `-f` to bypass the cache on any read.
 
-Requires `curl` and `jq`; `secret-tool` (from `libsecret`) only for
-`set-key` / `logout`.
+Requires `curl`, `jq` and `python3` (for `bin/mayarfs`, which does every file
+open, read, write, replace and delete on descriptors rather than on names);
+`secret-tool` (from `libsecret`) only for `set-key` / `logout`.
 
 ## Caching
 
@@ -211,6 +231,8 @@ Panel.qml         # bar widget + panel — rendering, plus the key field
                   #   (which only pipes what is typed to mayarctl)
 MayarIcon.qml     # the brand mark, as themed Shape paths
 bin/mayarctl      # API, credentials, caching, JSON for the panel
+bin/mayarfs       # the filesystem, done on descriptors: the key file and
+                  #   the response cache
 docs/             # screenshots used by this README
 preview.png       # marketplace listing preview
 ```
